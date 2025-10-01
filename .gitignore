@@ -146,8 +146,8 @@ mlruns/
 # Trading specific
 trading_logs/
 backtest_results/
-*.csv
-*.json
+# *.csv  # Commented out to allow data files
+# *.json  # Commented out to allow config files
 
 # macOS
 .DS_Store
