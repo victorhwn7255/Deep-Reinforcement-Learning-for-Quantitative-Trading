@@ -30,8 +30,7 @@ class CriticNetwork(nn.Module):
         # Handle multi-dimensional state spaces (1D, 2D, etc.)
         self.fc1 = nn.Linear(np.prod(self.input_dims) + n_actions, self.fc1_dims)
         self.fc2 = nn.Linear(self.fc1_dims, self.fc2_dims)
-        self.q1 = nn.Linear(self.fc2_dims, 1)
-        self.q2 = nn.Linear(self.fc2_dims, 1)
+        self.q = nn.Linear(self.fc2_dims, 1)  # <-- Only ONE Q head now
 
         self.optimizer = optim.Adam(self.parameters(), lr=beta)
         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
@@ -39,18 +38,17 @@ class CriticNetwork(nn.Module):
         self.to(self.device)
 
     def forward(self, state, action):
+        # Flatten if input has extra dims (like [batch, channels, features])
         if len(state.shape) > 2:
             state = state.view(state.size(0), -1)
-            
-        action_value = self.fc1(T.cat([state, action], dim=1))
-        action_value = F.relu(action_value)
-        action_value = self.fc2(action_value)
-        action_value = F.relu(action_value)
 
-        q1 = self.q1(action_value)
-        q2 = self.q2(action_value)
+        # Concatenate state and action
+        action_value = T.cat([state, action], dim=1)
+        action_value = F.relu(self.fc1(action_value))
+        action_value = F.relu(self.fc2(action_value))
+        q = self.q(action_value)
 
-        return q1, q2
+        return q  # Shape: [batch_size, 1]
 
     def save_checkpoint(self):
         T.save(self.state_dict(), self.checkpoint_file)
@@ -128,7 +126,7 @@ class ActorNetwork(nn.Module):
         action = T.tanh(actions) * T.tensor(self.max_action).to(self.device)
 
         log_probs = dist.log_prob(actions)
-        log_probs -= T.log(1 - action.pow(2) + self.reparam_noise)
+        log_probs -= T.log(1 - T.tanh(actions).pow(2) + self.reparam_noise)
         log_probs = log_probs.sum(1, keepdim=True)
 
         return action, log_probs
