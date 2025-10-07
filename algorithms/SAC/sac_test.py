@@ -19,8 +19,8 @@ if __name__ == '__main__':
     # Goal: Keep pendulum upright (minimize angle and angular velocity)
       
     agent = Agent(
-      alpha=1e-3,              # Actor learning rate
-      beta=1e-3,               # Critic learning rate  
+      alpha=0.0003,              # Actor learning rate
+      beta=0.0003,               # Critic learning rate  
       input_dims=[3],          # Observation space: [cos(θ), sin(θ), angular_velocity]
       tau=0.005,               # Polyak averaging factor
       env=env,                 # Environment (needed for action space)
@@ -32,12 +32,12 @@ if __name__ == '__main__':
       layer2_size=256,         # Hidden layer 2
       batch_size=256,          # Training batch size
       reward_scale=1.0,        # Pendulum rewards are negative, scale down
-      target_entropy=-1.0,     # Target entropy = -|action_dims| = -1
-      alpha_lr=1e-3,           # Temperature learning rate
+      target_entropy=-0.5,     # Target entropy = -|action_dims| = -1
+      alpha_lr=0.0001,           # Temperature learning rate
       policy_type="normal"     # Gaussian policy for continuous control
     )
     
-    n_games = 3900
+    n_games = 1800
     
     filename = env_id + '_'+ str(n_games) + 'games_scale' + str(agent.scale) + '_clamp_on_sigma.png'
     figure_file = '../../plots/' + filename

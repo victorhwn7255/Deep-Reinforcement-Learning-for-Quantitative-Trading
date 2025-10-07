@@ -209,8 +209,6 @@ class Agent:
         critic_loss = critic_1_loss + critic_2_loss
 
         critic_loss.backward()
-        #T.nn.utils.clip_grad_norm_(self.critic_1.parameters(), 1.0)
-        #T.nn.utils.clip_grad_norm_(self.critic_2.parameters(), 1.0)
         self.critic_1.optimizer.step()
         self.critic_2.optimizer.step()      
         
