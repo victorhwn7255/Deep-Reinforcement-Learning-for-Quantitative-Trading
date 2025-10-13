@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 import torch
+import time
 
 from agent import Agent
 
@@ -22,18 +23,23 @@ if __name__ == '__main__':
     np.random.seed(random_seed)
     env = gym.make(env_id)
     
-    N = 2048
-    batch_size = 64
-    n_epochs = 10
-    learning_rate = 0.0003
+    N = 512
     max_action = env.action_space.high[0]
     
-    agent = Agent(n_actions=env.action_space.shape[0], batch_size=batch_size,
-                  learning_rate=learning_rate, n_epochs=n_epochs,
-                  input_dims=env.observation_space.shape)
+    agent = Agent(
+          n_actions=env.action_space.shape[0], 
+          batch_size=128,
+          learning_rate=0.001, 
+          n_epochs=18,
+          input_dims=env.observation_space.shape,
+          fc1_dims=256, 
+          fc2_dims=256  
+    )
 
     score_history = []
-    max_steps = 300_000
+    best_score = -np.inf
+    start_time = time.time()
+    max_steps = 600_000
     total_steps = 0
     traj_length = 0
     episode = 1
@@ -47,19 +53,29 @@ if __name__ == '__main__':
         while not (done or truncated):
             action, prob = agent.choose_action(observation)
             act = action_adapter(action, max_action)
+
             observation_, reward, done, truncated, info = env.step(act)
-            r = clip_reward(reward)
+
+            r = reward
             total_steps += 1
             traj_length += 1
             score += reward
-            agent.remember(observation, observation_, action,
-                           prob, r, done or truncated)
+            agent.remember(observation, observation_, action, prob, r, done or truncated)
             if traj_length % N == 0:
                 agent.learn()
                 traj_length = 0
             observation = observation_
+        
         score_history.append(score)
         avg_score = np.mean(score_history[-100:])
-        print('{} Episode {} total steps {} avg score {:.1f}'.
-              format(env_id, episode, total_steps, avg_score))
+        progress = (total_steps / max_steps) * 100
+        elapsed_time = time.time() - start_time
+        steps_per_sec = total_steps / elapsed_time if elapsed_time > 0 else 0
+        print(f'[{progress:5.1f}%] Ep {episode:3d}: Score {score:6.1f} | Avg {avg_score:6.1f} | Total Steps {total_steps:6d} | {steps_per_sec:.0f} steps/s')
+        
+        if avg_score > best_score:
+            best_score = avg_score
+            agent.save_models()
+            print(f"  ✓ New best avg: {avg_score:.1f}, models saved")
+        
         episode += 1
