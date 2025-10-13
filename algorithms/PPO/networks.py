@@ -3,14 +3,20 @@ import torch as T
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Beta, Categorical, Dirichlet
+from torch.distributions import Beta, Normal, Dirichlet
 
 ########################
 ### Actor for Policy ###
 ########################
 class ContinuousActorNetwork(nn.Module):
-    def __init__(self, n_actions, input_dims, learning_rate,
-                 fc1_dims=128, fc2_dims=128, chkpt_dir='models/'):
+    def __init__(self, 
+                 n_actions, 
+                 input_dims, 
+                 learning_rate, 
+                 fc1_dims=128, 
+                 fc2_dims=128, 
+                 chkpt_dir='models/'
+                 ):
         super(ContinuousActorNetwork, self).__init__()
         self.checkpoint_file = os.path.join(chkpt_dir, 'actor_continuous_ppo')
         
@@ -56,8 +62,13 @@ class ContinuousActorNetwork(nn.Module):
 ### Critic for Value Function ###
 #################################
 class ContinuousCriticNetwork(nn.Module):
-    def __init__(self, input_dims, learning_rate,
-                 fc1_dims=128, fc2_dims=128, chkpt_dir='models/'):
+    def __init__(self, 
+                 input_dims, 
+                 learning_rate, 
+                 fc1_dims=128, 
+                 fc2_dims=128, 
+                 chkpt_dir='models/'
+                 ):
         super(ContinuousCriticNetwork, self).__init__()
         self.checkpoint_file = os.path.join(chkpt_dir, 'critic_continuous_ppo')
         self.fc1 = nn.Linear(*input_dims, fc1_dims)

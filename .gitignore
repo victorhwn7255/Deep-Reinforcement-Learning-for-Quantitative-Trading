@@ -149,6 +149,11 @@ backtest_results/
 # *.csv  # Commented out to allow data files
 # *.json  # Commented out to allow config files
 
+# RL Training artifacts
+videos/
+*.pt
+plots/
+
 # macOS
 .DS_Store
 .AppleDouble

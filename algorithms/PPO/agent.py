@@ -5,15 +5,25 @@ from networks import ContinuousActorNetwork, ContinuousCriticNetwork
 
 
 class Agent:
-    def __init__(self, n_actions, input_dims, gamma=0.99, learning_rate=3e-4,
-                 gae_lambda=0.95, policy_clip=0.2, batch_size=64, n_epochs=10):
+    def __init__(self, 
+                 n_actions, 
+                 input_dims, 
+                 gamma=0.99, 
+                 learning_rate=3e-4,
+                 gae_lambda=0.95, 
+                 policy_clip=0.2, 
+                 batch_size=64, 
+                 n_epochs=10,
+                 fc1_dims=128,
+                 fc2_dims=128
+                 ):
         self.gamma = gamma
         self.policy_clip = policy_clip
         self.n_epochs = n_epochs
         self.gae_lambda = gae_lambda
         self.entropy_coefficient = 1e-3
-        self.actor = ContinuousActorNetwork(n_actions, input_dims, learning_rate)
-        self.critic = ContinuousCriticNetwork(input_dims, learning_rate)
+        self.actor = ContinuousActorNetwork(n_actions, input_dims, learning_rate, fc1_dims, fc2_dims)
+        self.critic = ContinuousCriticNetwork(input_dims, learning_rate, fc1_dims, fc2_dims)
         self.memory = PPOMemory(batch_size)
 
     def remember(self, state, state_, action, probs, reward, done):

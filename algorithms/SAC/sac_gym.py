@@ -1,8 +1,9 @@
 import os
 import numpy as np
 import gymnasium as gym
-from gymnasium.wrappers import RecordVideo
+import time
 
+from gymnasium.wrappers import RecordVideo
 from agent import Agent
 from utils import plot_learning_curve
 
@@ -13,8 +14,8 @@ if __name__ == '__main__':
     
     # 2. SET UP AGENT SETTINGS
     agent = Agent(
-        alpha=3e-4,              # Actor learning rate
-        beta=3e-4,               # Critic learning rate  
+        alpha=0.0009,              # Actor learning rate
+        beta=0.0009,               # Critic learning rate  
         input_dims=[3],          # Observation space: [cos(θ), sin(θ), angular_velocity]
         tau=0.005,               # Polyak averaging factor
         env=env,                 # Environment (needed for action space)
@@ -25,17 +26,18 @@ if __name__ == '__main__':
         layer1_size=256,         # Hidden layer 1
         layer2_size=256,         # Hidden layer 2
         batch_size=256,          # Training batch size
-        reward_scale=1.0,        # Reward scaling
-        target_entropy=-0.5,     # Target entropy for exploration
-        alpha_lr=1e-4,           # Temperature learning rate
+        reward_scale=1,        # Reward scaling
+        target_entropy=-0.2,     # Target entropy for exploration
+        alpha_lr=0.0009,           # Temperature learning rate
         policy_type="normal"     # Gaussian policy for continuous control
     )
     
     # 3. TRAIN THE AGENT
-    n_games = 1800
+    n_games = 3600
     steps = 0
     score_history = []
     best_score = -np.inf
+    start_time = time.time()
     
     print("Starting SAC training...")
     
@@ -53,7 +55,7 @@ if __name__ == '__main__':
             agent.remember(observation, action, reward, observation_, done)
             
             # Start learning after sufficient experience
-            if agent.memory.mem_cntr > 2100:
+            if agent.memory.mem_cntr > 256 and steps % 3 == 0:
                 agent.learn()
                 
             score += reward
@@ -69,13 +71,24 @@ if __name__ == '__main__':
 
         if i % 5 == 0:
             progress = i / n_games * 100
-            print(f'[{progress:5.1f}%] Ep {i:3d}: Score {score:6.1f} | Avg {avg_score:6.1f} | Total Steps {steps:5d}')
+            elapsed_time = time.time() - start_time
+            steps_per_min = (steps / elapsed_time) * 60 if elapsed_time > 0 else 0
+            print(f'[{progress:5.1f}%] Ep {i:3d}: Score {score:6.1f} | Avg {avg_score:6.1f} | Steps {steps:7d} | {steps_per_min:,.0f} steps/min | Device: {agent.actor.device}') 
     
-    print(f"Training completed! Final average score: {avg_score:.1f}")
-    
-    # 4. SAVE FINAL MODEL
-    agent.save_models()
-    print("Final model saved!")
+    #4. PRINT SUMMARY
+    total_time_min = (time.time() - start_time) / 60
+    avg_steps_per_min = steps / total_time_min if total_time_min > 0 else 0
+    print("\n" + "="*60)
+    print("🎉 TRAINING COMPLETED! 🎉")
+    print("="*60)
+    print(f"Final Average Score:  {avg_score:7.1f}")
+    print(f"Best Average Score:   {best_score:7.1f}")
+    print(f"Total Episodes:       {n_games:7d}")
+    print(f"Total Steps:          {steps:7d}")
+    print(f"Training Time:        {total_time_min:7.1f} min")
+    print(f"Avg Steps/Min:        {avg_steps_per_min:7,.0f}")
+    print(f"✓ Best model saved")
+    print("="*60 + "\n")
     
     # 5. VISUALIZE TRAINING CURVE
     filename = f'{env_id}_{n_games}games_scale{agent.scale}_final.png'
