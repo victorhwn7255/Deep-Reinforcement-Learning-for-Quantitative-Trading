@@ -3,17 +3,38 @@ import pandas as pd
 
 class Env:
   def __init__(self, df, tickers, lag=5):
+    # Build feature columns list
     self.columns = []
+    
+    # Asset-specific features (per ticker)
     for ticker in tickers:
       self.columns += [
         ticker + '_RSI',
         ticker + '_MACD',
         ticker + '_MACD_Signal',
+        ticker + '_volatility',
       ]
+      
+    # VIX-based features
+    self.columns += [
+      'VIX_normalized',
+      'VIX_regime',
+      'VIX_term_structure',
+    ]
+      
     cleaned_data = df.dropna()
     self.states = cleaned_data[self.columns].to_numpy()
     self.prices = cleaned_data[tickers].to_numpy() # used for computing returns
     self.lag = lag
+    
+    print(f"Environment initialized:")
+    print(f"  - State features: {len(self.columns)}")
+    print(f"  - Features per ticker: 4 (RSI, MACD, MACD_Signal, volatility)")
+    print(f"  - Market features: 3 (VIX_normalized, VIX_regime, VIX_term_structure)")
+    print(f"  - Total state dimension per timestep: {self.states.shape[1]}")
+    print(f"  - Lag (temporal window): {lag}")
+    print(f"  - Final input dimension: {self.states.shape[1] * lag}")
+    print(f"  - Number of data points: {len(self.states)}")
 
   # to initialize the environment at the beginning of a simulation or training episode
   # the initial state will be the first 5 data points
@@ -50,6 +71,9 @@ class Env:
     # done if the next-next position doesn't exist in states array
     # (because there will be no next state)
     done = self.pos + self.lag >= len(self.states)
+    
+    # get next state (sliding window)
+    next_state = self.states[self.pos - self.lag:self.pos]
 
     # return next state, reward, done
-    return self.states[self.pos - self.lag:self.pos], pct_change, done
+    return next_state, pct_change, done
