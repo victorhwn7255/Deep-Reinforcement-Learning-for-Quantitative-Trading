@@ -135,7 +135,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else
 #######################
 ### Hyperparameters ###
 #######################
-total_timesteps = 500_000       # Total number of training steps
+total_timesteps = 1_800_000       # Total number of training steps
 learning_rate = 0.001           # Adam optimizer learning rate
 gamma = 0.99                    # Discount factor for future rewards
 entropy_weight = 0.001          # Weight for entropy regularization (exploration)
