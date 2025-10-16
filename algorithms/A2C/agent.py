@@ -1,3 +1,4 @@
+import numpy as np
 import time
 import torch
 import torch.nn as nn
@@ -63,6 +64,10 @@ class Agent:
         episode_returns = []
         losses = []
         
+        # track the best model during training
+        best_avg_return = -np.inf
+        best_model_state = None
+        
         start_time = time.time()
         obs = env.reset()
         G = 0  # keep track of RL-return
@@ -112,12 +117,36 @@ class Agent:
             if done:
                 episode_returns.append(G)
                 print(f"global_step={global_step}, episode={len(episode_returns)}, episode_return={G}")
+                
+                ##########################################################
+                ### Track and save best model based on rolling average ###
+                ##########################################################
+                if len(episode_returns) >= 10:
+                    avg_return = np.mean(episode_returns[-10:])  # Last 10 episodes
+                    
+                    if avg_return > best_avg_return:
+                        best_avg_return = avg_return
+                        # Deep copy the model state
+                        best_model_state = {
+                            'model_state_dict': {k: v.cpu().clone() for k, v in self.ac_network.state_dict().items()},
+                            'optimizer_state_dict': {k: v.cpu().clone() if torch.is_tensor(v) else v 
+                                                    for k, v in self.optimizer.state_dict().items()},
+                            'episode': len(episode_returns),
+                            'global_step': global_step,
+                            'avg_return': avg_return,
+                            'all_returns': episode_returns.copy()
+                        }
+                        # Save best model immediately to disk (don't wait for training to finish!)
+                        torch.save(best_model_state, "models/a2c_portfolio_best.pth")
+                        print(f"  ✓ New best model! Avg return (last 10 episodes): {avg_return:.4f}")
+                        print(f"    → Saved to models/a2c_portfolio_best.pth")
+                
                 G = 0  # reset
                 obs = env.reset()
             else:
                 obs = next_obs
         
-        return episode_returns, losses
+        return episode_returns, losses, best_model_state
     
     def save_model(self, path):
         """Save the trained model"""
@@ -128,3 +157,12 @@ class Agent:
         """Load a trained model"""
         self.ac_network.load_state_dict(torch.load(path, map_location=self.device))
         print(f"Model loaded from {path}")
+        
+    def load_best_model(self, best_model_state):
+        """Load the best model from training"""
+        if best_model_state is not None:
+            self.ac_network.load_state_dict(best_model_state['model_state_dict'])
+            print(f"Best model loaded (Episode {best_model_state['episode']}, "
+                  f"Avg Return: {best_model_state['avg_return']:.4f})")
+        else:
+            print("No best model state available")
