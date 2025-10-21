@@ -24,6 +24,7 @@ df = yf.download(tickers, start=start, end=end)
 df = df['Close']
 df = df.dropna().copy()
 
+
 ####################
 ### VIX Features ###
 ####################
@@ -42,10 +43,11 @@ df = df.join(vix_combined, how='left')
 df['VIX'] = df['VIX'].ffill()
 df['VIX3M'] = df['VIX3M'].ffill()
 
-# VIX Feature 1: VIX_normalized: Normalized VIX level
-df['VIX_normalized'] = (df['VIX'] - 20) / 20  # Range roughly [-1, 1]
+# VIX Feature 1 - VIX_normalized: Normalized VIX level
+# Range roughly [-1, 1]
+df['VIX_normalized'] = (df['VIX'] - 20) / 20
 
-# VIX Feature 2: VIX_regime: Categorical regime (Low/Normal/High volatility)
+# VIX Feature 2 - VIX_regime: Categorical regime (Low/Normal/High volatility)
 def get_vix_regime(vix):
     if vix < 15:
         return -1.0  # Low vol / complacent
@@ -55,18 +57,86 @@ def get_vix_regime(vix):
         return 1.0   # High vol / stress
 df['VIX_regime'] = df['VIX'].apply(get_vix_regime)
 
-# 3. VIX_term_structure: REAL term structure using VIX3M
+# VIX Feature 3 - VIX_term_structure: REAL term structure using VIX3M
 # Positive = Contango (normal markets, VIX3M > VIX)
 # Negative = Backwardation (stressed markets, VIX3M < VIX)
 df['VIX_term_structure'] = (df['VIX3M'] - df['VIX']) / df['VIX']
 df['VIX_term_structure'] = np.clip(df['VIX_term_structure'], -1, 1)  # Clip extreme values
+
+
+##############################
+### Credit Spread Features ###
+##############################
+credit_df = pd.read_csv('../../data/CREDIT_SPREAD_2010_2024.csv')
+credit_df['observation_date'] = pd.to_datetime(credit_df['observation_date'])
+credit_df = credit_df.set_index('observation_date')
+
+df = df.join(credit_df, how='left')
+df['BAMLC0A4CBBB'] = df['BAMLC0A4CBBB'].ffill()
+df['Credit_Spread'] = df['BAMLC0A4CBBB'] / 100
+
+# CS Feature 1 - Credit_Spread_normalized
+# Normalize around typical value of 2% (0.02). 
+# Normal range: 1-2.5% → normalized ≈ [-0.5, 0.25]
+# Crisis: 5%+ → normalized ≈ 1.5+
+df['Credit_Spread_normalized'] = (df['Credit_Spread'] - 0.02) / 0.02
+
+# CS Feature 2 - Credit_Spread_regime (categorical)
+def get_credit_regime(spread):
+    if spread < 0.02:      # <2%
+        return -1.0  # Risk-on (normal credit conditions)
+    elif spread < 0.04:    # 2-4%
+        return 0.0   # Elevated risk
+    else:                  # >4%
+        return 1.0   # Risk-off (crisis/severe stress)
+
+df['Credit_Spread_regime'] = df['Credit_Spread'].apply(get_credit_regime)
+
+# count regime distribution
+regime_counts = df['Credit_Spread_regime'].value_counts().sort_index()
+print(f"  - Credit_Spread_regime distribution:")
+regime_names = {-1.0: 'Risk-On', 0.0: 'Elevated', 1.0: 'Crisis'}
+for regime, count in regime_counts.items():
+    pct = count / len(df) * 100
+    print(f"    {regime_names[regime]:>10} ({regime:+.0f}): {count:4d} days ({pct:.1f}%)")
+
+# CS Feature 3 - Credit_Spread_momentum (RoC)
+# 30-day momentum captures credit deterioration/improvement
+df['Credit_Spread_momentum'] = df['Credit_Spread'].pct_change(30)
+df['Credit_Spread_momentum'] = np.clip(df['Credit_Spread_momentum'], -1, 1)
+
+# CS Feature 4 - Credit_Spread_zscore
+# How many standard deviations from rolling mean?
+# Identifies extreme moves (leading indicator of regime change)
+df['Credit_Spread_zscore'] = (
+    (df['Credit_Spread'] - df['Credit_Spread'].rolling(252).mean()) / 
+    (df['Credit_Spread'].rolling(252).std() + 1e-8)
+)
+df['Credit_Spread_zscore'] = np.clip(df['Credit_Spread_zscore'], -3, 3)
+
+# CS Feature 5 - Credit_Spread_velocity (acceleration)
+# Second derivative - how fast is spread changing?
+# Rapid widening = panic; rapid tightening = recovery
+df['Credit_Spread_velocity'] = df['Credit_Spread_momentum'].diff(5)
+df['Credit_Spread_velocity'] = np.clip(df['Credit_Spread_velocity'], -1, 1)
+
+# CS Feature 6 - Credit_VIX_divergence
+# When credit spreads and VIX diverge, it signals regime transition
+# Positive = VIX rising faster (equity fear)
+# Negative = Credit spreads rising faster (credit fear)
+vix_normalized = (df['VIX'] - df['VIX'].rolling(60).mean()) / (df['VIX'].rolling(60).std() + 1e-8)
+credit_normalized = (df['Credit_Spread'] - df['Credit_Spread'].rolling(60).mean()) / (df['Credit_Spread'].rolling(60).std() + 1e-8)
+df['Credit_VIX_divergence'] = vix_normalized - credit_normalized
+df['Credit_VIX_divergence'] = np.clip(df['Credit_VIX_divergence'], -3, 3)
+
 
 ####################
 ### RSI Features ###
 ####################
 for ticker in tickers:
   df[ticker + '_RSI'] = talib.RSI(df[ticker], timeperiod=14) / 50 - 1 # change RSI range to [-1, +1]
-  
+
+
 #####################
 ### MACD Features ###
 #####################
@@ -74,6 +144,7 @@ for ticker in tickers:
   macd, signal, hist = talib.MACD(df[ticker], fastperiod=12, slowperiod=26, signalperiod=9)
   df[ticker + '_MACD'] = macd / df[ticker] * 10 # scale by close price
   df[ticker + '_MACD_Signal'] = signal / df[ticker] * 10 # scale by close price
+
 
 ###########################
 ### Realized Volatility ###
@@ -92,6 +163,7 @@ print("\nAll features created:")
 feature_cols = [col for col in df.columns if col not in tickers + ['VIX', 'VIX3M']]
 for col in sorted(feature_cols):
     print(f"  - {col}")
+
 
 ##########################
 ### SPLIT Train & Test ###
@@ -135,7 +207,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else
 #######################
 ### Hyperparameters ###
 #######################
-total_timesteps = 6900000      # Total number of training steps
+total_timesteps = 1800000      # Total number of training steps
 learning_rate = 0.001           # Adam optimizer learning rate
 gamma = 0.99                    # Discount factor for future rewards
 entropy_weight = 0.001          # Weight for entropy regularization (exploration)
