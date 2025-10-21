@@ -21,6 +21,16 @@ class Env:
       'VIX_regime',
       'VIX_term_structure',
     ]
+    
+    # Credit Spread-based features
+    self.columns += [
+      'Credit_Spread_normalized',     
+      'Credit_Spread_regime',         
+      'Credit_Spread_momentum',       
+      'Credit_Spread_zscore',         
+      'Credit_Spread_velocity',       
+      'Credit_VIX_divergence',        
+    ]
       
     cleaned_data = df.dropna()
     self.states = cleaned_data[self.columns].to_numpy()
@@ -31,6 +41,7 @@ class Env:
     print(f"  - State features: {len(self.columns)}")
     print(f"  - Features per ticker: 4 (RSI, MACD, MACD_Signal, volatility)")
     print(f"  - Market features: 3 (VIX_normalized, VIX_regime, VIX_term_structure)")
+    print(f"  - Credit Spread features: 6 (normalized, regime, momentum, zscore, velocity, VIX_divergence)")
     print(f"  - Total state dimension per timestep: {self.states.shape[1]}")
     print(f"  - Lag (temporal window): {lag}")
     print(f"  - Final input dimension: {self.states.shape[1] * lag}")
