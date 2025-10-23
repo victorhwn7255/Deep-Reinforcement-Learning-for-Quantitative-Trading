@@ -137,15 +137,6 @@ for ticker in tickers:
   df[ticker + '_RSI'] = talib.RSI(df[ticker], timeperiod=14) / 50 - 1 # change RSI range to [-1, +1]
 
 
-#####################
-### MACD Features ###
-#####################
-for ticker in tickers:
-  macd, signal, hist = talib.MACD(df[ticker], fastperiod=12, slowperiod=26, signalperiod=9)
-  df[ticker + '_MACD'] = macd / df[ticker] * 10 # scale by close price
-  df[ticker + '_MACD_Signal'] = signal / df[ticker] * 10 # scale by close price
-
-
 ###########################
 ### Realized Volatility ###
 ###########################

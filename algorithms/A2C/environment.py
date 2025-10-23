@@ -10,8 +10,6 @@ class Env:
     for ticker in tickers:
       self.columns += [
         ticker + '_RSI',
-        ticker + '_MACD',
-        ticker + '_MACD_Signal',
         ticker + '_volatility',
       ]
       
@@ -39,7 +37,7 @@ class Env:
     
     print(f"Environment initialized:")
     print(f"  - State features: {len(self.columns)}")
-    print(f"  - Features per ticker: 4 (RSI, MACD, MACD_Signal, volatility)")
+    print(f"  - Features per ticker: 2 (RSI, volatility)")
     print(f"  - Market features: 3 (VIX_normalized, VIX_regime, VIX_term_structure)")
     print(f"  - Credit Spread features: 6 (normalized, regime, momentum, zscore, velocity, VIX_divergence)")
     print(f"  - Total state dimension per timestep: {self.states.shape[1]}")
