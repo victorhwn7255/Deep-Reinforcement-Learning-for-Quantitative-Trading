@@ -155,7 +155,7 @@ class Agent:
     
     def load_model(self, path):
         """Load a trained model"""
-        self.ac_network.load_state_dict(torch.load(path, map_location=self.device))
+        self.ac_network.load_state_dict(torch.load(path, map_location=self.device, weights_only=False))
         print(f"Model loaded from {path}")
         
     def load_best_model(self, best_model_state):
