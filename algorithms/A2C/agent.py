@@ -60,7 +60,9 @@ class Agent:
         return torch.as_tensor(a, dtype=dtype, device=self.device)
     
     def learn(self, env, total_timesteps):
-        """Main training loop"""
+        ##########################
+        ### Main training loop ###
+        ##########################
         episode_returns = []
         losses = []
         
