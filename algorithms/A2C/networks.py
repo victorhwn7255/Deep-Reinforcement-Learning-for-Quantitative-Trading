@@ -21,8 +21,10 @@ class AdvantageActorCritic(nn.Module):
     def forward(self, x):
         features = self.network(x.reshape(1, -1))
 
+        # Actor output
         alpha = F.softplus(self.actor(features))  # Dirichlet parameter
         
+        # Critic output
         value = self.critic(features)  # State-value function
 
         return alpha, value

@@ -18,7 +18,7 @@ from agent import Agent
 start = '2010-01-01'
 end = '2024-12-31'
 
-tickers = ['VNQ', 'SPY', 'GLD', 'BTC-USD']
+tickers = ['VNQ', 'SPY', 'TLT', 'GLD', 'BTC-USD']
 
 df = yf.download(tickers, start=start, end=end)
 df = df['Close']
@@ -174,7 +174,7 @@ print(f"\nEnvironment state dimension: {env.states.shape[1] * env.lag}")
 #################
 ### Benchmark ###
 #################
-weights = np.array([0.1, 0.8, 0.05, 0.05, 0]) # constant weight portfolio
+weights = np.array([0.1, 0.5, 0.3, 0.05, 0.05, 0]) # constant weight portfolio
 done = False
 obs = env.reset()
 rewards = []
@@ -343,7 +343,7 @@ while True:
         ### EVALUATE BENCHMARK PORTFOLIO ###
         ###################################
         print("Evaluating Benchmark...")
-        benchmark_weights = np.array([0.1, 0.8, 0.05, 0.05, 0])
+        benchmark_weights = np.array([0.1, 0.5, 0.3, 0.05, 0.05, 0])
         obs = env_test.reset()
         benchmark_rewards = []
         done = False
@@ -375,7 +375,7 @@ while True:
         print(f"  - Max Drawdown: {a2c_max_drawdown*100:.2f}%")
         print(f"  - Ann. Volatility: {np.std(a2c_rewards)*np.sqrt(252)*100:.2f}%")
         
-        print(f"\nBenchmark (10/80/5/5/0):")
+        print(f"\nBenchmark (VNQ:10% SPY:50% TLT:30% GLD:5% BTC:5%):")
         print(f"  - Total Return: {benchmark_total_return*100:.2f}%")
         print(f"  - Sharpe Ratio: {benchmark_sharpe:.4f}")
         print(f"  - Max Drawdown: {benchmark_max_drawdown*100:.2f}%")
@@ -427,7 +427,7 @@ while True:
             
             # 4. Portfolio Weights Over Time
             ax4 = axes[1, 1]
-            asset_names = ['VNQ', 'SPY', 'GLD', 'BTC', 'Cash']
+            asset_names = ['VNQ', 'SPY', 'TLT', 'GLD', 'BTC', 'Cash']
             for i, name in enumerate(asset_names):
                 ax4.plot(a2c_actions[:, i], label=name, alpha=0.7)
             ax4.set_title('A2C Portfolio Weights Over Time', fontsize=12, fontweight='bold')
@@ -467,10 +467,10 @@ while True:
         print("\n✓ Plot displayed!")
         
     elif choice == '3':
-        print("\nExiting... Goodbye! 👋")
+        print("\nExiting... Goodbye!")
         break
     
     else:
-        print("\n⚠️  Invalid choice. Please enter 1, 2, or 3.")
+        print("\n  Invalid choice. Please enter 1, 2, or 3.")
 
 print("="*50)
