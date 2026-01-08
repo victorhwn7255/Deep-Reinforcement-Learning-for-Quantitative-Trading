@@ -386,9 +386,9 @@ if len(episode_returns) > 0:
         plt.show()
         print("✓ Plot displayed!")
 
-###############
-### Summary ###
-###############
+########################
+### Training Summary ###
+########################
 print("\n" + "="*60)
 print("TRAINING COMPLETE - NEXT STEPS")
 print("="*60)
