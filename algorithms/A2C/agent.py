@@ -150,6 +150,21 @@ class Agent:
         
         return episode_returns, losses, best_model_state
     
+    def choose_action_deterministic(self, observation):
+        """Deterministic action selection using mean of Dirichlet"""
+        if isinstance(observation, np.ndarray):
+            obs = observation.flatten()
+        else:
+            obs = np.array(observation).flatten()
+        
+        with torch.no_grad():
+            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+            alpha, _ = self.ac_network(obs_tensor)
+            actions = alpha / alpha.sum(dim=-1, keepdim=True)
+            actions_np = actions.squeeze().cpu().numpy()
+        
+        return actions_np
+
     def save_model(self, path):
         """Save the trained model"""
         torch.save(self.ac_network.state_dict(), path)
