@@ -3,8 +3,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import talib
-
+import random
 import time
+from datetime import datetime
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -146,6 +148,10 @@ for ticker in tickers:
     # Normalize: typical stock vol is ~0.20 (20%), so divide by 0.25 to get roughly [-1, 1] range
     df[ticker + '_volatility'] = (df[ticker + '_volatility'] - 0.25) / 0.25
 
+
+########################
+### Features Summary ###
+########################
 df = df.dropna()
 print(f"\nData shape after feature engineering: {df.shape}")
 print(f"Final date range: {df.index[0]} to {df.index[-1]}")
@@ -155,6 +161,21 @@ feature_cols = [col for col in df.columns if col not in tickers + ['VIX', 'VIX3M
 for col in sorted(feature_cols):
     print(f"  - {col}")
 
+print("\nFeature Range Validation:")
+feature_cols = [col for col in df.columns if col not in tickers + ['VIX', 'VIX3M', 'BAMLC0A4CBBB', 'Credit_Spread']]
+
+out_of_range = []
+for col in feature_cols:
+    min_val, max_val = df[col].min(), df[col].max()
+    if min_val < -10 or max_val > 10:
+        out_of_range.append(f"  {col}: [{min_val:.2f}, {max_val:.2f}]")
+
+if out_of_range:
+    print("  ⚠ Features with unusual ranges:")
+    for item in out_of_range:
+        print(item)
+else:
+    print("  ✓ All features within expected ranges")
 
 ##########################
 ### SPLIT Train & Test ###
@@ -258,9 +279,9 @@ print(f"  - Worst episode return: {np.min(episode_returns):.4f}")
 if len(episode_returns) >= 10:
     print(f"  - Final 10 episodes avg: {np.mean(episode_returns[-10:]):.4f}")
     
-##########################
-### Print Return Chart ###
-##########################
+################################
+### Post-Training Evaluation ###
+################################
 print("\n" + "="*50)
 while True:
     print("\nOptions:")
@@ -307,42 +328,214 @@ while True:
         env_test = Env(df_test, tickers, lag=5)
         print(f"Test set: {len(df_test)} days ({df_test.index[0]} to {df_test.index[-1]})")
         
-        ##############################
-        ### EVALUATE TRAINED MODEL ###
-        ##############################
-        print("\nEvaluating A2C Agent...")
-        obs = env_test.reset()
-        a2c_rewards = []
-        a2c_actions = []
-        done = False
+        #############################
+        ### CHOOSE EVALUATION MODE ###
+        #############################
+        print("\n" + "="*50)
+        print("EVALUATION MODE SELECTION")
+        print("="*50)
+        print("\nHow would you like to evaluate the model?")
+        print("  1. Deterministic (mean allocation - reproducible, single run)")
+        print("  2. Stochastic with seed (reproducible, single run)")
+        print("  3. Multiple stochastic runs (statistical analysis)")
         
-        while not done:
-            with torch.no_grad():
-                alpha, _ = eval_agent.ac_network(eval_agent.np2torch(obs))
-                actions = eval_agent.sample_action(alpha)
-                actions_np = actions.detach().cpu().numpy().flatten()
+        eval_mode = input("\nEnter choice (1, 2, or 3): ").strip()
+        
+        # Initialize variables for all modes
+        n_runs = 1  # Default for modes 1 and 2
+        show_statistics = False
+        
+        ##############################
+        ### MODE 1: DETERMINISTIC ###
+        ##############################
+        if eval_mode == '1':
+            print("\n✓ Using deterministic evaluation (mean of Dirichlet)")
+            print("  This gives reproducible results by using expected allocation")
             
-            a2c_actions.append(actions_np.copy())
-            obs, reward, done = env_test.step(actions_np)
-            a2c_rewards.append(reward)
+            obs = env_test.reset()
+            a2c_rewards = []
+            a2c_actions = []
+            done = False
+            
+            while not done:
+                actions_np = eval_agent.choose_action_deterministic(obs)
+                a2c_actions.append(actions_np.copy())
+                obs, reward, done = env_test.step(actions_np)
+                a2c_rewards.append(reward)
+            
+            a2c_rewards = np.array(a2c_rewards)
+            a2c_actions = np.array(a2c_actions)
+            
+            # Calculate metrics
+            a2c_cumulative = np.cumprod(1 + a2c_rewards)
+            a2c_total_return = a2c_cumulative[-1] - 1
+            a2c_sharpe = np.mean(a2c_rewards) / (np.std(a2c_rewards) + 1e-8) * np.sqrt(252)
+            
+            # Maximum drawdown
+            a2c_running_max = np.maximum.accumulate(a2c_cumulative)
+            a2c_drawdown = (a2c_cumulative - a2c_running_max) / a2c_running_max
+            a2c_max_drawdown = np.min(a2c_drawdown)
+            
+            # For display
+            display_mode = "Deterministic"
         
-        a2c_rewards = np.array(a2c_rewards)
-        a2c_actions = np.array(a2c_actions)
+        ##################################
+        ### MODE 2: STOCHASTIC + SEED ###
+        ##################################
+        elif eval_mode == '2':
+            print("\n✓ Using stochastic evaluation with fixed seed")
+            print("  This gives reproducible results with sampling randomness")
+            
+            # Set seed for reproducibility
+            seed = 42
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(seed)
+            
+            obs = env_test.reset()
+            a2c_rewards = []
+            a2c_actions = []
+            done = False
+            
+            while not done:
+                with torch.no_grad():
+                    alpha, _ = eval_agent.ac_network(eval_agent.np2torch(obs))
+                    actions = eval_agent.sample_action(alpha)
+                    actions_np = actions.detach().cpu().numpy().flatten()
+                
+                a2c_actions.append(actions_np.copy())
+                obs, reward, done = env_test.step(actions_np)
+                a2c_rewards.append(reward)
+            
+            a2c_rewards = np.array(a2c_rewards)
+            a2c_actions = np.array(a2c_actions)
+            
+            # Calculate metrics
+            a2c_cumulative = np.cumprod(1 + a2c_rewards)
+            a2c_total_return = a2c_cumulative[-1] - 1
+            a2c_sharpe = np.mean(a2c_rewards) / (np.std(a2c_rewards) + 1e-8) * np.sqrt(252)
+            
+            # Maximum drawdown
+            a2c_running_max = np.maximum.accumulate(a2c_cumulative)
+            a2c_drawdown = (a2c_cumulative - a2c_running_max) / a2c_running_max
+            a2c_max_drawdown = np.min(a2c_drawdown)
+            
+            # For display
+            display_mode = "Stochastic (seed=42)"
         
-        # Calculate metrics for A2C
-        a2c_cumulative = np.cumprod(1 + a2c_rewards)
-        a2c_total_return = a2c_cumulative[-1] - 1
-        a2c_sharpe = np.mean(a2c_rewards) / (np.std(a2c_rewards) + 1e-8) * np.sqrt(252)
+        #################################
+        ### MODE 3: MULTIPLE RUNS ###
+        #################################
+        elif eval_mode == '3':
+            # Get number of runs with validation
+            n_runs_input = input("\nHow many evaluation runs? (recommended: 10-20, default: 10): ").strip()
+            try:
+                n_runs = int(n_runs_input) if n_runs_input else 10
+                n_runs = max(1, min(n_runs, 100))  # Clamp between 1-100
+                if n_runs != int(n_runs_input or 10):
+                    print(f"  Note: Adjusted to {n_runs} runs (valid range: 1-100)")
+            except ValueError:
+                print("  Invalid input. Using default of 10 runs.")
+                n_runs = 10
+            
+            print(f"\n✓ Running {n_runs} stochastic evaluations...")
+            print("  This may take a few minutes...")
+            
+            all_returns = []
+            all_sharpes = []
+            all_drawdowns = []
+            all_volatilities = []
+            all_actions_list = []
+            all_rewards_list = []
+            
+            # Progress indicator
+            print("  Progress: ", end="", flush=True)
+            progress_interval = max(1, n_runs // 10)
+            
+            for run in range(n_runs):
+                obs = env_test.reset()
+                run_rewards = []
+                run_actions = []
+                done = False
+                
+                while not done:
+                    with torch.no_grad():
+                        alpha, _ = eval_agent.ac_network(eval_agent.np2torch(obs))
+                        actions = eval_agent.sample_action(alpha)
+                        actions_np = actions.detach().cpu().numpy().flatten()
+                    
+                    run_actions.append(actions_np.copy())
+                    obs, reward, done = env_test.step(actions_np)
+                    run_rewards.append(reward)
+                
+                run_rewards = np.array(run_rewards)
+                run_actions = np.array(run_actions)
+                
+                # Calculate metrics for this run
+                run_cumulative = np.cumprod(1 + run_rewards)
+                run_return = run_cumulative[-1] - 1
+                run_sharpe = np.mean(run_rewards) / (np.std(run_rewards) + 1e-8) * np.sqrt(252)
+                run_volatility = np.std(run_rewards) * np.sqrt(252)
+                
+                run_running_max = np.maximum.accumulate(run_cumulative)
+                run_drawdown = (run_cumulative - run_running_max) / run_running_max
+                run_max_drawdown = np.min(run_drawdown)
+                
+                all_returns.append(run_return)
+                all_sharpes.append(run_sharpe)
+                all_drawdowns.append(run_max_drawdown)
+                all_volatilities.append(run_volatility)
+                all_actions_list.append(run_actions)
+                all_rewards_list.append(run_rewards)
+                
+                # Progress indicator
+                if (run + 1) % progress_interval == 0 or run == n_runs - 1:
+                    progress_pct = int((run + 1) * 100 / n_runs)
+                    print(f"{progress_pct}%", end=" ", flush=True)
+            
+            print("\n  Complete!\n")
+            
+            # Print individual run results
+            print("  Individual Run Results:")
+            for run in range(n_runs):
+                print(f"    Run {run+1:2d}/{n_runs}: Return = {all_returns[run]*100:7.2f}%, "
+                      f"Sharpe = {all_sharpes[run]:.4f}, Max DD = {all_drawdowns[run]*100:.2f}%")
+            
+            # Convert to arrays
+            all_returns = np.array(all_returns)
+            all_sharpes = np.array(all_sharpes)
+            all_drawdowns = np.array(all_drawdowns)
+            all_volatilities = np.array(all_volatilities)
+            
+            # Use median run for visualization
+            median_idx = np.argsort(all_returns)[len(all_returns)//2]
+            a2c_rewards = all_rewards_list[median_idx]
+            a2c_actions = all_actions_list[median_idx]
+            
+            # Recalculate for median run (for visualization)
+            a2c_cumulative = np.cumprod(1 + a2c_rewards)
+            a2c_total_return = a2c_cumulative[-1] - 1
+            a2c_sharpe = np.mean(a2c_rewards) / (np.std(a2c_rewards) + 1e-8) * np.sqrt(252)
+            a2c_running_max = np.maximum.accumulate(a2c_cumulative)
+            a2c_drawdown = (a2c_cumulative - a2c_running_max) / a2c_running_max
+            a2c_max_drawdown = np.min(a2c_drawdown)
+            
+            # For display
+            display_mode = f"Multiple Runs (n={n_runs})"
+            show_statistics = True
         
-        # Maximum drawdown
-        a2c_running_max = np.maximum.accumulate(a2c_cumulative)
-        a2c_drawdown = (a2c_cumulative - a2c_running_max) / a2c_running_max
-        a2c_max_drawdown = np.min(a2c_drawdown)
+        else:
+            print("Invalid choice, skipping evaluation")
+            continue
         
         ###################################
         ### EVALUATE BENCHMARK PORTFOLIO ###
         ###################################
-        print("Evaluating Benchmark...")
+        print("\nEvaluating Benchmark...")
         benchmark_weights = np.array([0.1, 0.5, 0.3, 0.05, 0.05, 0])
         obs = env_test.reset()
         benchmark_rewards = []
@@ -363,27 +556,124 @@ while True:
         benchmark_max_drawdown = np.min(benchmark_drawdown)
         
         ########################
-        ### PRINT COMPARISON ###
+        ### PRINT RESULTS ###
         ########################
         print("\n" + "="*50)
         print("TEST SET PERFORMANCE")
         print("="*50)
+        print(f"Evaluation Mode: {display_mode}")
         
-        print(f"\nA2C Agent:")
-        print(f"  - Total Return: {a2c_total_return*100:.2f}%")
-        print(f"  - Sharpe Ratio: {a2c_sharpe:.4f}")
-        print(f"  - Max Drawdown: {a2c_max_drawdown*100:.2f}%")
-        print(f"  - Ann. Volatility: {np.std(a2c_rewards)*np.sqrt(252)*100:.2f}%")
+        if show_statistics:
+            # Show aggregated statistics
+            print("\n" + "-"*50)
+            print("A2C AGENT - STATISTICAL SUMMARY")
+            print("-"*50)
+            print(f"  Total Return:")
+            print(f"    Mean:        {np.mean(all_returns)*100:>8.2f}%")
+            print(f"    Std Dev:     {np.std(all_returns)*100:>8.2f}%")
+            print(f"    Min:         {np.min(all_returns)*100:>8.2f}%")
+            print(f"    Max:         {np.max(all_returns)*100:>8.2f}%")
+            print(f"    Median:      {np.median(all_returns)*100:>8.2f}%")
+            print(f"    95% CI:      [{np.percentile(all_returns, 2.5)*100:.2f}%, {np.percentile(all_returns, 97.5)*100:.2f}%]")
+            
+            print(f"\n  Sharpe Ratio:")
+            print(f"    Mean:        {np.mean(all_sharpes):>8.4f}")
+            print(f"    Std Dev:     {np.std(all_sharpes):>8.4f}")
+            print(f"    Min:         {np.min(all_sharpes):>8.4f}")
+            print(f"    Max:         {np.max(all_sharpes):>8.4f}")
+            
+            print(f"\n  Max Drawdown:")
+            print(f"    Mean:        {np.mean(all_drawdowns)*100:>8.2f}%")
+            print(f"    Std Dev:     {np.std(all_drawdowns)*100:>8.2f}%")
+            print(f"    Best (min):  {np.max(all_drawdowns)*100:>8.2f}%")
+            print(f"    Worst (max): {np.min(all_drawdowns)*100:>8.2f}%")
+            
+            print(f"\n  Ann. Volatility:")
+            print(f"    Mean:        {np.mean(all_volatilities)*100:>8.2f}%")
+            print(f"    Std Dev:     {np.std(all_volatilities)*100:>8.2f}%")
+            
+            # Probability metrics
+            prob_beat_benchmark = np.mean(all_returns > benchmark_total_return) * 100
+            prob_positive = np.mean(all_returns > 0) * 100
+            prob_2x_benchmark = np.mean(all_returns > 2 * benchmark_total_return) * 100
+            
+            print(f"\n  Probability Metrics:")
+            print(f"    P(beat benchmark):   {prob_beat_benchmark:>6.1f}%")
+            print(f"    P(positive return):  {prob_positive:>6.1f}%")
+            print(f"    P(>2x benchmark):    {prob_2x_benchmark:>6.1f}%")
+            
+            # Coefficient of variation
+            cv_return = np.std(all_returns) / np.mean(all_returns) if np.mean(all_returns) != 0 else 0
+            print(f"\n  Stability Metric:")
+            print(f"    Coefficient of Variation: {cv_return:.4f}")
+            if cv_return < 0.05:
+                stability = "VERY STABLE ✓✓✓"
+            elif cv_return < 0.10:
+                stability = "STABLE ✓✓"
+            elif cv_return < 0.15:
+                stability = "MODERATE ✓"
+            else:
+                stability = "UNSTABLE ⚠"
+            print(f"    Assessment: {stability}")
+            
+            # Option to save results to CSV
+            save_csv = input("\n  Would you like to save detailed results to CSV? (y/n): ").strip().lower()
+            if save_csv == 'y':
+                results_df = pd.DataFrame({
+                    'run': range(1, n_runs + 1),
+                    'total_return_pct': all_returns * 100,
+                    'sharpe_ratio': all_sharpes,
+                    'max_drawdown_pct': all_drawdowns * 100,
+                    'ann_volatility_pct': all_volatilities * 100
+                })
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"evaluation_results_{timestamp}.csv"
+                results_df.to_csv(filename, index=False)
+                print(f"  ✓ Results saved to: {filename}")
+            
+        else:
+            # Show single run results
+            print("\n" + "-"*50)
+            print("A2C AGENT")
+            print("-"*50)
+            print(f"  Total Return:      {a2c_total_return*100:>8.2f}%")
+            print(f"  Sharpe Ratio:      {a2c_sharpe:>8.4f}")
+            print(f"  Max Drawdown:      {a2c_max_drawdown*100:>8.2f}%")
+            print(f"  Ann. Volatility:   {np.std(a2c_rewards)*np.sqrt(252)*100:>8.2f}%")
         
-        print(f"\nBenchmark (VNQ:10% SPY:50% TLT:30% GLD:5% BTC:5%):")
-        print(f"  - Total Return: {benchmark_total_return*100:.2f}%")
-        print(f"  - Sharpe Ratio: {benchmark_sharpe:.4f}")
-        print(f"  - Max Drawdown: {benchmark_max_drawdown*100:.2f}%")
-        print(f"  - Ann. Volatility: {np.std(benchmark_rewards)*np.sqrt(252)*100:.2f}%")
+        print("\n" + "-"*50)
+        print("BENCHMARK (VNQ:10% SPY:50% TLT:30% GLD:5% BTC:5%)")
+        print("-"*50)
+        print(f"  Total Return:      {benchmark_total_return*100:>8.2f}%")
+        print(f"  Sharpe Ratio:      {benchmark_sharpe:>8.4f}")
+        print(f"  Max Drawdown:      {benchmark_max_drawdown*100:>8.2f}%")
+        print(f"  Ann. Volatility:   {np.std(benchmark_rewards)*np.sqrt(252)*100:>8.2f}%")
         
-        print(f"\nA2C vs Benchmark:")
-        print(f"  - Return difference: {(a2c_total_return - benchmark_total_return)*100:+.2f}%")
-        print(f"  - Sharpe difference: {a2c_sharpe - benchmark_sharpe:+.4f}")
+        print("\n" + "-"*50)
+        print("COMPARISON (A2C vs Benchmark)")
+        print("-"*50)
+        
+        if show_statistics:
+            mean_return_diff = (np.mean(all_returns) - benchmark_total_return) * 100
+            mean_sharpe_diff = np.mean(all_sharpes) - benchmark_sharpe
+            print(f"  Return Difference:   {mean_return_diff:>+8.2f}% (mean)")
+            print(f"  Sharpe Difference:   {mean_sharpe_diff:>+8.4f} (mean)")
+            
+            if np.mean(all_returns) > benchmark_total_return:
+                print(f"\n  ✓ A2C outperformed benchmark in {prob_beat_benchmark:.1f}% of runs")
+                print(f"  ✓ Average outperformance: {mean_return_diff:.2f}%")
+            else:
+                print(f"\n  ⚠ A2C underperformed benchmark on average")
+        else:
+            return_diff = (a2c_total_return - benchmark_total_return) * 100
+            sharpe_diff = a2c_sharpe - benchmark_sharpe
+            print(f"  Return Difference:   {return_diff:>+8.2f}%")
+            print(f"  Sharpe Difference:   {sharpe_diff:>+8.4f}")
+            
+            if a2c_total_return > benchmark_total_return:
+                print(f"\n  ✓ A2C outperformed benchmark by {return_diff:.2f}%")
+            else:
+                print(f"\n  ⚠ A2C underperformed benchmark by {abs(return_diff):.2f}%")
         
         #####################
         ### VISUALIZATION ###
@@ -395,9 +685,12 @@ while True:
             
             # 1. Cumulative Returns
             ax1 = axes[0, 0]
-            ax1.plot(a2c_cumulative, label='A2C Agent', linewidth=2)
-            ax1.plot(benchmark_cumulative, label='Benchmark', linewidth=2, linestyle='--')
-            ax1.set_title('Cumulative Returns', fontsize=12, fontweight='bold')
+            ax1.plot(a2c_cumulative, label='A2C Agent', linewidth=2, color='blue')
+            ax1.plot(benchmark_cumulative, label='Benchmark', linewidth=2, linestyle='--', color='orange')
+            if show_statistics:
+                ax1.set_title(f'Cumulative Returns (Median of {n_runs} runs)', fontsize=12, fontweight='bold')
+            else:
+                ax1.set_title('Cumulative Returns', fontsize=12, fontweight='bold')
             ax1.set_xlabel('Trading Days')
             ax1.set_ylabel('Cumulative Return')
             ax1.legend()
@@ -406,21 +699,32 @@ while True:
             # 2. Drawdown
             ax2 = axes[0, 1]
             ax2.fill_between(range(len(a2c_drawdown)), a2c_drawdown*100, 0, 
-                              alpha=0.3, label='A2C Drawdown')
+                              alpha=0.4, label='A2C Drawdown', color='blue')
             ax2.fill_between(range(len(benchmark_drawdown)), benchmark_drawdown*100, 0, 
-                              alpha=0.3, label='Benchmark Drawdown')
-            ax2.set_title('Drawdown', fontsize=12, fontweight='bold')
+                              alpha=0.4, label='Benchmark Drawdown', color='orange')
+            ax2.set_title('Drawdown Over Time', fontsize=12, fontweight='bold')
             ax2.set_xlabel('Trading Days')
             ax2.set_ylabel('Drawdown (%)')
             ax2.legend()
             ax2.grid(True, alpha=0.3)
             
-            # 3. Daily Returns Distribution
+            # 3. Daily Returns Distribution (or Return Distribution if multiple runs)
             ax3 = axes[1, 0]
-            ax3.hist(a2c_rewards*100, bins=50, alpha=0.5, label='A2C', density=True)
-            ax3.hist(benchmark_rewards*100, bins=50, alpha=0.5, label='Benchmark', density=True)
-            ax3.set_title('Daily Returns Distribution', fontsize=12, fontweight='bold')
-            ax3.set_xlabel('Daily Return (%)')
+            if show_statistics:
+                ax3.hist(all_returns*100, bins=min(30, n_runs), alpha=0.7, label=f'A2C (n={n_runs})', 
+                        density=True, color='blue', edgecolor='black')
+                ax3.axvline(np.mean(all_returns)*100, color='blue', linestyle='--', 
+                           linewidth=2, label='A2C Mean')
+                ax3.axvline(benchmark_total_return*100, color='orange', linestyle='--', 
+                           linewidth=2, label='Benchmark')
+                ax3.set_title('Total Return Distribution', fontsize=12, fontweight='bold')
+                ax3.set_xlabel('Total Return (%)')
+            else:
+                ax3.hist(a2c_rewards*100, bins=50, alpha=0.5, label='A2C', density=True, color='blue')
+                ax3.hist(benchmark_rewards*100, bins=50, alpha=0.5, label='Benchmark', 
+                        density=True, color='orange')
+                ax3.set_title('Daily Returns Distribution', fontsize=12, fontweight='bold')
+                ax3.set_xlabel('Daily Return (%)')
             ax3.set_ylabel('Density')
             ax3.legend()
             ax3.grid(True, alpha=0.3)
@@ -428,17 +732,24 @@ while True:
             # 4. Portfolio Weights Over Time
             ax4 = axes[1, 1]
             asset_names = ['VNQ', 'SPY', 'TLT', 'GLD', 'BTC', 'Cash']
-            for i, name in enumerate(asset_names):
-                ax4.plot(a2c_actions[:, i], label=name, alpha=0.7)
-            ax4.set_title('A2C Portfolio Weights Over Time', fontsize=12, fontweight='bold')
+            colors = ['brown', 'green', 'blue', 'gold', 'orange', 'gray']
+            for i, (name, color) in enumerate(zip(asset_names, colors)):
+                ax4.plot(a2c_actions[:, i], label=name, alpha=0.7, linewidth=1.5, color=color)
+            if show_statistics:
+                ax4.set_title(f'Portfolio Weights Over Time (Median run)', fontsize=12, fontweight='bold')
+            else:
+                ax4.set_title('Portfolio Weights Over Time', fontsize=12, fontweight='bold')
             ax4.set_xlabel('Trading Days')
             ax4.set_ylabel('Weight')
             ax4.legend(loc='upper right')
             ax4.grid(True, alpha=0.3)
             ax4.set_ylim([0, 1])
             
+            plt.suptitle(f'Evaluation Results: {df_test.index[0].strftime("%Y-%m-%d")} to {df_test.index[-1].strftime("%Y-%m-%d")}', 
+                        fontsize=14, fontweight='bold', y=0.995)
             plt.tight_layout()
             plt.show()
+            
             print("\n✓ Visualization displayed!")
     
     elif choice == '2':
@@ -454,8 +765,8 @@ while True:
         episode_returns_pct = [ret * 100 for ret in episode_returns]
         
         plt.figure(figsize=(10, 6))
-        plt.plot(episode_returns_pct, alpha=0.2, label='Raw Returns', linewidth=0.5)
-        plt.plot(smooth(episode_returns_pct), label='Smoothed Returns', linewidth=2)
+        plt.plot(episode_returns_pct, alpha=0.2, label='Raw Returns', linewidth=0.5, color='blue')
+        plt.plot(smooth(episode_returns_pct), label='Smoothed Returns', linewidth=2, color='red')
         plt.title("Episode Returns During Training", fontsize=14, fontweight='bold')
         plt.xlabel("Episode Number", fontsize=12)
         plt.ylabel("Total Return (%)", fontsize=12)
