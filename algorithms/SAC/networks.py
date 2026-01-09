@@ -1,194 +1,304 @@
-import os
-import torch as T
+import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.distributions.normal import Normal
-from torch.distributions.dirichlet import Dirichlet
-import numpy as np
+from torch.distributions import Dirichlet
 
 
-########################
-### Critic (Q-value) ###
-########################
-class CriticNetwork(nn.Module):
-    def __init__(self, beta, input_dims, fc1_dims, fc2_dims, 
-                 n_actions, name, chkpt_dir='models/'):
-        super(CriticNetwork, self).__init__()
-        self.input_dims = input_dims
-        self.fc1_dims = fc1_dims
-        self.fc2_dims = fc2_dims
-        self.n_actions = n_actions
-        self.name = name
-        self.checkpoint_dir = chkpt_dir
-        self.checkpoint_file = os.path.join(self.checkpoint_dir, name+'_sac_critic')
-
-        #####################
-        ### NETWORK LAYER ###
-        #####################
-        ### nn.Linear(num of inputs, num of outputs)    
-        # Handle multi-dimensional state spaces (1D, 2D, etc.)
-        self.fc1 = nn.Linear(np.prod(self.input_dims) + n_actions, self.fc1_dims)
-        self.fc2 = nn.Linear(self.fc1_dims, self.fc2_dims)
-        self.q = nn.Linear(self.fc2_dims, 1)  # <-- Only ONE Q head now
-
-        self.optimizer = optim.Adam(self.parameters(), lr=beta)
-        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-
-        self.to(self.device)
-
-    def forward(self, state, action):
-        # Flatten if input has extra dims (like [batch, channels, features])
-        if len(state.shape) > 2:
-            state = state.view(state.size(0), -1)
-
-        # Concatenate state and action
-        action_value = T.cat([state, action], dim=1)
-        action_value = F.relu(self.fc1(action_value))
-        action_value = F.relu(self.fc2(action_value))
-        q = self.q(action_value)
-
-        return q  # Shape: [batch_size, 1]
-
-    def save_checkpoint(self):
-        T.save(self.state_dict(), self.checkpoint_file)
-
-    def load_checkpoint(self):
-        self.load_state_dict(T.load(self.checkpoint_file))
-
-
-######################
-### Actor (Policy) ###
-######################
-class ActorNetwork(nn.Module):
-    def __init__(self, alpha, input_dims, fc1_dims, fc2_dims, max_action,
-                 n_actions, name, chkpt_dir='models/'):
-        super(ActorNetwork, self).__init__()
-        self.input_dims = input_dims
-        self.fc1_dims = fc1_dims
-        self.fc2_dims = fc2_dims
-        self.n_actions = n_actions
-        self.name = name
-        self.max_action = max_action
-        self.checkpoint_dir = chkpt_dir
-        self.checkpoint_file = os.path.join(self.checkpoint_dir, name+'_sac_actor')
-        self.reparam_noise = 1e-6
-        
-        #####################
-        ### NETWORK LAYER ###
-        #####################
-        ### nn.Linear(num of inputs, num of outputs)    
-        self.fc1 = nn.Linear(np.prod(self.input_dims), self.fc1_dims)
-        self.fc2 = nn.Linear(self.fc1_dims, self.fc2_dims)
-
-        # Gaussian policy
-        self.mu = nn.Linear(self.fc2_dims, self.n_actions)
-        self.sigma = nn.Linear(self.fc2_dims, self.n_actions)
-
-        # Dirichlet policy
-        self.alpha_head = nn.Linear(self.fc2_dims, self.n_actions)
-
-        self.optimizer = optim.Adam(self.parameters(), lr=alpha)
-        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-        self.to(self.device)
-
-    def forward_normal(self, state):
-        if len(state.shape) > 2:
-            state = state.view(state.size(0), -1)
-            
-        prob = F.relu(self.fc1(state))
-        prob = F.relu(self.fc2(prob))
-
-        mu = self.mu(prob)
-
-        log_sigma = self.sigma(prob)
-        log_sigma = T.clamp(log_sigma, min=-20, max=2)
-        sigma = log_sigma.exp()
-
-        return mu, sigma
-
-    def forward_dirichlet(self, state):
-        if len(state.shape) > 2:
-            state = state.view(state.size(0), -1)
-            
-        prob = F.relu(self.fc1(state))
-        prob = F.relu(self.fc2(prob))
-
-        alpha = self.alpha_head(prob)
-        alpha = F.softplus(alpha) + 1e-6
-        return alpha
-
-    def sample_normal(self, state, reparameterize=True):
-        mu, sigma = self.forward_normal(state)
-        dist = T.distributions.Normal(mu, sigma)
-
-        actions = dist.rsample() if reparameterize else dist.sample()
-        action = T.tanh(actions) * T.tensor(self.max_action).to(self.device)
-
-        log_probs = dist.log_prob(actions)
-        log_probs -= T.log(1 - T.tanh(actions).pow(2) + self.reparam_noise)
-        log_probs = log_probs.sum(1, keepdim=True)
-
-        return action, log_probs
-
-    def sample_dirichlet(self, state, reparameterize=True):
-        alpha = self.forward_dirichlet(state)
-        dist = T.distributions.Dirichlet(alpha)
-
-        action = dist.rsample() if reparameterize else dist.sample()
-        log_probs = dist.log_prob(action).unsqueeze(1)
-
-        return action, log_probs
-
-    # EXAMPLE
-    # state.shape = [batch_size, state_dim(number of features)], eg [32,10]
-    # action.shape = [batch_size, n_actions(number of stocks)], eg [32, 4]
-    # log_probs.shape = [batch_size, 1], eg [32, 1]
+class SoftQNetwork(nn.Module):
+    """
+    Soft Q-Network (Critic) for SAC
     
-    def save_checkpoint(self):
-        T.save(self.state_dict(), self.checkpoint_file)
-
-    def load_checkpoint(self):
-        self.load_state_dict(T.load(self.checkpoint_file))
-
-
-####################
-### Value (V(s)) ###
-#################### 
-class ValueNetwork(nn.Module):
-    def __init__(self, beta, input_dims, fc1_dims, fc2_dims, name, chkpt_dir='models/'):
-        super(ValueNetwork, self).__init__()
-        self.input_dims = input_dims
-        self.fc1_dims = fc1_dims
-        self.fc2_dims = fc2_dims
-        self.name = name
-        self.checkpoint_dir = chkpt_dir
-        self.checkpoint_file = os.path.join(self.checkpoint_dir, name+'_sac_v')
-
-        self.fc1 = nn.Linear(np.prod(self.input_dims), self.fc1_dims)
-        self.fc2 = nn.Linear(self.fc1_dims, self.fc2_dims)
-        self.v = nn.Linear(self.fc2_dims, 1)
-
-        self.optimizer = optim.Adam(self.parameters(), lr=beta)
-        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
-
-        self.to(self.device)
-
-    def forward(self, state):
-        if len(state.shape) > 2:
-            state = state.view(state.size(0), -1)
+    Estimates Q(s, a) - the expected return starting from state s,
+    taking action a, and following the policy thereafter.
+    
+    SAC uses two Q-networks to mitigate overestimation bias.
+    """
+    
+    def __init__(self, n_input, n_action, n_hidden=256):
+        """
+        Initialize Q-network
+        
+        Args:
+            n_input: State dimension
+            n_action: Action dimension
+            n_hidden: Number of hidden units
+        """
+        super().__init__()
+        
+        # Q-network takes state-action pair as input
+        self.network = nn.Sequential(
+            nn.Linear(n_input + n_action, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, 1)
+        )
+        
+        # Initialize weights
+        self._initialize_weights()
+        
+    def _initialize_weights(self):
+        """Initialize network weights using Xavier initialization"""
+        for layer in self.network:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0.0)
+                
+    def forward(self, state, action):
+        """
+        Forward pass
+        
+        Args:
+            state: State tensor (batch_size, state_dim)
+            action: Action tensor (batch_size, action_dim)
             
-        state_value = self.fc1(state)
-        state_value = F.relu(state_value)
-        state_value = self.fc2(state_value)
-        state_value = F.relu(state_value)
+        Returns:
+            Q-value tensor (batch_size, 1)
+        """
+        # Concatenate state and action
+        x = torch.cat([state, action], dim=-1)
+        return self.network(x)
 
-        v = self.v(state_value)
 
-        return v
+class PolicyNetwork(nn.Module):
+    """
+    Policy Network (Actor) for SAC with Dirichlet Distribution
+    
+    Outputs parameters of a Dirichlet distribution for portfolio weights.
+    The Dirichlet distribution naturally ensures weights sum to 1.
+    
+    Uses the reparameterization trick for gradient estimation:
+    - Sample from a simpler distribution (Gamma)
+    - Transform to get Dirichlet samples
+    """
+    
+    def __init__(self, n_input, n_action, n_hidden=256, log_std_min=-20, log_std_max=2):
+        """
+        Initialize policy network
+        
+        Args:
+            n_input: State dimension
+            n_action: Action dimension (number of assets + cash)
+            n_hidden: Number of hidden units
+            log_std_min: Minimum log standard deviation (for numerical stability)
+            log_std_max: Maximum log standard deviation
+        """
+        super().__init__()
+        
+        self.n_action = n_action
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+        
+        # Shared feature extractor
+        self.feature_net = nn.Sequential(
+            nn.Linear(n_input, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU()
+        )
+        
+        # Output Dirichlet concentration parameters
+        # Use softplus to ensure positivity, then add small constant
+        self.alpha_head = nn.Linear(n_hidden, n_action)
+        
+        # Initialize weights
+        self._initialize_weights()
+        
+    def _initialize_weights(self):
+        """Initialize network weights"""
+        for layer in self.feature_net:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0.0)
+        
+        # Initialize alpha head with smaller weights for stability
+        nn.init.xavier_uniform_(self.alpha_head.weight, gain=0.1)
+        nn.init.constant_(self.alpha_head.bias, 1.0)  # Start with uniform-ish
+        
+    def forward(self, state):
+        """
+        Forward pass - compute Dirichlet concentration parameters
+        
+        Args:
+            state: State tensor
+            
+        Returns:
+            alpha: Dirichlet concentration parameters (batch_size, n_action)
+        """
+        features = self.feature_net(state)
+        
+        # Ensure alpha > 0 (required for Dirichlet)
+        # softplus(x) = log(1 + exp(x)) ensures smooth positive output
+        alpha = F.softplus(self.alpha_head(features)) + 0.1
+        
+        return alpha
+    
+    def sample(self, state, device='cpu'):
+        """
+        Sample action from policy (reparameterized)
+        
+        Uses the fact that if X_i ~ Gamma(alpha_i, 1), then
+        X / sum(X) ~ Dirichlet(alpha)
+        
+        Args:
+            state: State tensor
+            device: Device for computation
+            
+        Returns:
+            action: Sampled action (portfolio weights)
+            log_prob: Log probability of action
+            alpha: Dirichlet parameters
+        """
+        alpha = self.forward(state)
+        
+        # Create Dirichlet distribution
+        # Move to CPU for Dirichlet (MPS not supported)
+        alpha_cpu = alpha.cpu()
+        dist = Dirichlet(alpha_cpu)
+        
+        # Sample using reparameterization
+        action_cpu = dist.rsample()
+        
+        # Compute log probability
+        log_prob_cpu = dist.log_prob(action_cpu)
+        
+        # Move back to original device
+        action = action_cpu.to(device)
+        log_prob = log_prob_cpu.to(device)
+        
+        return action, log_prob, alpha
+    
+    def evaluate(self, state, action, device='cpu'):
+        """
+        Evaluate log probability of an action given state
+        
+        Args:
+            state: State tensor
+            action: Action tensor (portfolio weights)
+            device: Device for computation
+            
+        Returns:
+            log_prob: Log probability of action
+            entropy: Entropy of distribution
+        """
+        alpha = self.forward(state)
+        
+        # Create Dirichlet distribution
+        alpha_cpu = alpha.cpu()
+        action_cpu = action.cpu()
+        
+        dist = Dirichlet(alpha_cpu)
+        
+        # Clamp action slightly away from 0 and 1 for numerical stability
+        action_clamped = torch.clamp(action_cpu, min=1e-6, max=1.0 - 1e-6)
+        # Renormalize to sum to 1
+        action_clamped = action_clamped / action_clamped.sum(dim=-1, keepdim=True)
+        
+        log_prob_cpu = dist.log_prob(action_clamped)
+        entropy_cpu = dist.entropy()
+        
+        log_prob = log_prob_cpu.to(device)
+        entropy = entropy_cpu.to(device)
+        
+        return log_prob, entropy
+    
+    def get_deterministic_action(self, state):
+        """
+        Get deterministic action (mean of Dirichlet)
+        
+        For evaluation/deployment where we want reproducible behavior.
+        
+        Args:
+            state: State tensor
+            
+        Returns:
+            action: Mean portfolio weights (alpha / sum(alpha))
+        """
+        alpha = self.forward(state)
+        # Mean of Dirichlet(alpha) is alpha / sum(alpha)
+        action = alpha / alpha.sum(dim=-1, keepdim=True)
+        return action
 
-    def save_checkpoint(self):
-        T.save(self.state_dict(), self.checkpoint_file)
 
-    def load_checkpoint(self):
-        self.load_state_dict(T.load(self.checkpoint_file))
+class ValueNetwork(nn.Module):
+    """
+    Value Network for SAC (optional)
+    
+    Estimates V(s) - the expected return starting from state s.
+    While the original SAC paper uses a separate value network,
+    later versions compute V from Q and the policy.
+    
+    Including it here for stability, as mentioned in the paper.
+    """
+    
+    def __init__(self, n_input, n_hidden=256):
+        """
+        Initialize value network
+        
+        Args:
+            n_input: State dimension
+            n_hidden: Number of hidden units
+        """
+        super().__init__()
+        
+        self.network = nn.Sequential(
+            nn.Linear(n_input, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, 1)
+        )
+        
+        # Initialize weights
+        self._initialize_weights()
+        
+    def _initialize_weights(self):
+        """Initialize network weights"""
+        for layer in self.network:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0.0)
+                
+    def forward(self, state):
+        """
+        Forward pass
+        
+        Args:
+            state: State tensor
+            
+        Returns:
+            V-value tensor
+        """
+        return self.network(state)
+
+
+# For backward compatibility with the naming convention
+class TwinQNetwork(nn.Module):
+    """
+    Twin Q-Networks for SAC
+    
+    Wraps two Q-networks and provides convenient access to both.
+    """
+    
+    def __init__(self, n_input, n_action, n_hidden=256):
+        super().__init__()
+        self.q1 = SoftQNetwork(n_input, n_action, n_hidden)
+        self.q2 = SoftQNetwork(n_input, n_action, n_hidden)
+        
+    def forward(self, state, action):
+        """
+        Get Q-values from both networks
+        
+        Returns:
+            q1_value, q2_value
+        """
+        return self.q1(state, action), self.q2(state, action)
+    
+    def q1_forward(self, state, action):
+        """Get Q-value from first network only"""
+        return self.q1(state, action)
+    
+    def q2_forward(self, state, action):
+        """Get Q-value from second network only"""
+        return self.q2(state, action)

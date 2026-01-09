@@ -1,304 +1,430 @@
-import os
-import torch as T
-import torch.nn.functional as F
 import numpy as np
+import time
+import copy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Dirichlet
 
+from networks import SoftQNetwork, PolicyNetwork, ValueNetwork
 from replay_buffer import ReplayBuffer
-from networks import ActorNetwork, CriticNetwork, ValueNetwork
+
 
 class Agent:
+    """
+    Soft Actor-Critic (SAC) Agent for Portfolio Management
+    
+    Key components:
+    - Twin Q-networks (critics) to mitigate overestimation bias
+    - Policy network (actor) with Dirichlet output for portfolio weights
+    - Value network (optional, for stability)
+    - Automatic entropy tuning
+    - Soft target network updates (Polyak averaging)
+    - Experience replay buffer for off-policy learning
+    """
+    
     def __init__(self, 
-                 alpha,           # LR for Actor
-                 beta,            # LR for Critics
-                 input_dims,      # e.g. [state_dim] or [lag*features]     
-                 tau,             # Polyak factor for target critics (e.g., 0.005–0.02)
-                 env, 
-                 env_id, 
-                 gamma=0.99, 
-                 max_size=1_000_000, 
-                 layer1_size=256, 
-                 layer2_size=256, 
-                 batch_size=100, 
-                 reward_scale=2, 
-                 target_entropy=None, 
-                 alpha_lr=3e-4,
-                 policy_type = "normal", # "normal" -> "Normal Distribution"
-                                         # "dirichlet" -> "Dirichlet Distribution"
-                 
-                 ## Action Space Dimension ##
-                 n_actions=2,     # the Dimensionality of action vector
-                                  # e.g, for Pendulum, n_actions = 1
-                                  # e.g, for Car Sim, n_actions = 2 (steer, throttle)
-                                  # e.g, for Portfolio Optimization, 
-                                  # n_actions = num_of_stocks + 1 (for cash)
+                 n_input, 
+                 n_action, 
+                 learning_rate=0.001,
+                 gamma=0.99,
+                 tau=0.005,
+                 alpha=0.2,
+                 auto_entropy_tuning=True,
+                 target_entropy=None,
+                 buffer_size=1000000,
+                 batch_size=256,
+                 learning_starts=10000,
+                 update_frequency=1,
+                 n_hidden=256,
+                 device='cpu'
                  ):
-        #######################
-        ### Hyperparameters ###
-        #######################
+        """
+        Initialize SAC agent
+        
+        Args:
+            n_input: State dimension
+            n_action: Action dimension (number of assets + cash)
+            learning_rate: Learning rate for all networks
+            gamma: Discount factor
+            tau: Soft update coefficient for target networks
+            alpha: Initial entropy coefficient (temperature)
+            auto_entropy_tuning: Whether to automatically tune alpha
+            target_entropy: Target entropy for auto-tuning (default: -n_action)
+            buffer_size: Replay buffer size
+            batch_size: Batch size for updates
+            learning_starts: Steps before starting to learn
+            update_frequency: How often to update networks
+            n_hidden: Hidden layer size
+            device: Device for computation
+        """
+        self.device = device
         self.gamma = gamma
         self.tau = tau
         self.batch_size = batch_size
-        self.n_actions = n_actions
-        self.scale = reward_scale
-        self.policy_type = policy_type.lower()
+        self.learning_starts = learning_starts
+        self.update_frequency = update_frequency
+        self.n_action = n_action
+        self.learning_rate = learning_rate
         
-        #####################
-        ### Replay Buffer ###
-        #####################
-        self.memory = ReplayBuffer(max_size, input_dims, n_actions)
+        # Initialize Q-networks (critics)
+        self.q1 = SoftQNetwork(n_input, n_action, n_hidden).to(device)
+        self.q2 = SoftQNetwork(n_input, n_action, n_hidden).to(device)
         
-        ################
-        ### NETWORKS ###
-        ################
-        # ACTOR
-        self.actor = ActorNetwork(alpha, 
-                                  input_dims, 
-                                  layer1_size,
-                                  layer2_size, 
-                                  n_actions=n_actions,
-                                  name=env_id+'_actor', 
-                                  max_action=env.action_space.high
-                                  )
+        # Initialize target Q-networks
+        self.q1_target = copy.deepcopy(self.q1)
+        self.q2_target = copy.deepcopy(self.q2)
         
-        # CRITICS (trained by Gradient Descent every update)
-        self.critic_1 = CriticNetwork(beta, 
-                                      input_dims, 
-                                      layer1_size,
-                                      layer2_size, 
-                                      n_actions=n_actions,
-                                      name=env_id+'_critic_1'
-                                      )
-        self.critic_2 = CriticNetwork(beta, 
-                                      input_dims, 
-                                      layer1_size,
-                                      layer2_size, 
-                                      n_actions=n_actions,
-                                      name=env_id+'_critic_2'
-                                      )
+        # Freeze target networks (no gradient computation)
+        for param in self.q1_target.parameters():
+            param.requires_grad = False
+        for param in self.q2_target.parameters():
+            param.requires_grad = False
         
-        # TARGET CRITICS (slow moving with Soft updates via Polyak)
-        self.critic_1_target = CriticNetwork(beta, 
-                                             input_dims, 
-                                             layer1_size, 
-                                             layer2_size,
-                                             n_actions=n_actions, 
-                                             name=env_id + "_critic_1_target"
-                                             )
-        self.critic_2_target = CriticNetwork(beta, 
-                                             input_dims, 
-                                             layer1_size, 
-                                             layer2_size,
-                                             n_actions=n_actions, 
-                                             name=env_id + "_critic_2_target"
-                                             )
-        # hard copy initial weights
-        self.critic_1_target.load_state_dict(self.critic_1.state_dict())
-        self.critic_2_target.load_state_dict(self.critic_2.state_dict())
+        # Initialize policy network (actor)
+        self.policy = PolicyNetwork(n_input, n_action, n_hidden).to(device)
         
-        # Freeze target critics parameters
-        for p in self.critic_1_target.parameters():
-            p.requires_grad = False
-        for p in self.critic_2_target.parameters():
-            p.requires_grad = False
+        # Initialize value network (optional, for stability)
+        self.value = ValueNetwork(n_input, n_hidden).to(device)
+        self.value_target = copy.deepcopy(self.value)
+        for param in self.value_target.parameters():
+            param.requires_grad = False
         
-        #################################
-        ### Temperature α (learnable) ###
-        #################################
-        # default target entropy = -|A|
-        # for Dirichlet (simplex), we may start with different target
-        self.target_entropy = (
-            -float(n_actions) if target_entropy is None else float(target_entropy)
-        )
+        # Initialize optimizers
+        self.q1_optimizer = optim.Adam(self.q1.parameters(), lr=learning_rate)
+        self.q2_optimizer = optim.Adam(self.q2.parameters(), lr=learning_rate)
+        self.policy_optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        self.value_optimizer = optim.Adam(self.value.parameters(), lr=learning_rate)
         
-        device = self.critic_1.device  # use the same device as your critics
-        
-        self.log_alpha = T.tensor(0.0, requires_grad=True, device=device)
-        self.alpha_optimizer = T.optim.Adam([self.log_alpha], lr=alpha_lr)
-        
-
-    ###############################################
-    ### Action selection for single observation ###
-    ###############################################
-    def choose_action(self, observation):
-        # Convert to a (1, obs_dim...) float tensor on the actor's device
-        if isinstance(observation, np.ndarray):
-            state = T.from_numpy(observation).to(self.actor.device, dtype=T.float32).unsqueeze(0)
-        elif T.is_tensor(observation):
-            state = observation.to(self.actor.device, dtype=T.float32)
-            if state.dim() == 1:  # ensure batch dim
-                state = state.unsqueeze(0)
-        else:
-            state = T.as_tensor(observation, dtype=T.float32, device=self.actor.device).unsqueeze(0)
-
-        with T.no_grad():
-            if self.policy_type == "dirichlet":
-                actions, _ = self.actor.sample_dirichlet(state, reparameterize=False)
-            else:  # "normal"
-                actions, _ = self.actor.sample_normal(state, reparameterize=False)
-
-        # Return as numpy (remove batch dimension)
-        return actions.squeeze(0).cpu().numpy()
-
-    ###########################################
-    ### Store a Transition in Replay Buffer ###
-    ###########################################
-    def remember(self, state, action, reward, new_state, done):
-        self.memory.store_transition(state, action, reward, new_state, done)
-
-    ############################
-    ### SAC v2 Training Loop ###
-    ############################
-    ###   1) Critic update (to TD target using target critics)
-    ###   2) Actor update (pathwise; minimize α logπ - min(Q))
-    ###   3) Temperature α update (toward target_entropy)
-    ###   4) Soft update target critics
-    def learn(self):
-        # Ensure enough samples
-        if self.memory.mem_cntr < self.batch_size:
-            return
-          
-        ###########################
-        ### Sample a Mini Batch ###
-        ###########################
-        s_np, a_np, r_np, s2_np, d_np = self.memory.sample_buffer(self.batch_size)
-        
-        device = self.critic_1.device
-        
-        s   = T.as_tensor(s_np,  dtype=T.float32, device=device)
-        a   = T.as_tensor(a_np,  dtype=T.float32, device=device)
-        r   = T.as_tensor(r_np,  dtype=T.float32, device=device)
-        d   = T.as_tensor(d_np,  dtype=T.bool,    device=device)
-        s2  = T.as_tensor(s2_np, dtype=T.float32, device=device)
-
-        # temperature hyperparameter
-        alpha = self.log_alpha.exp()
-
-        #########################
-        ### CRITIC TARGET (y) ###
-        #########################
-        # y = r + γ (1 - done) [ min(Q_tgt(s', a')) - α logπ(a'|s') ]
-        with T.no_grad():
-            if self.policy_type == "dirichlet":
-                a2, logp2 = self.actor.sample_dirichlet(s2, reparameterize=False)
+        # Entropy tuning
+        self.auto_entropy_tuning = auto_entropy_tuning
+        if auto_entropy_tuning:
+            # Target entropy is -dim(A) by default
+            if target_entropy is None:
+                self.target_entropy = -n_action
             else:
-                a2, logp2 = self.actor.sample_normal(s2, reparameterize=False)
-
-            q1_t = self.critic_1_target(s2, a2).view(-1)
-            q2_t = self.critic_2_target(s2, a2).view(-1)
-            q_t_min = T.min(q1_t, q2_t)
+                self.target_entropy = target_entropy
             
-            # (~d) is True for non-terminal transitions
-            # if done=True → (~d)=False → future value = 0
-            # if done=False → (~d)=True → include future value
-            # q_t_min: Expected future reward
-            # alpha * logp2: Entropy bonus (encourages exploration)
-            y = self.scale * r + self.gamma * (~d) * (q_t_min - alpha * logp2.view(-1))
-        
-        #########################
-        ### UPDATE CRITIC (Q) ###
-        #########################
-        # minimize MSE((Q1(s,a), y)) + MSE((Q2(s,a), y))
-        self.critic_1.optimizer.zero_grad()
-        self.critic_2.optimizer.zero_grad()
-
-        q1 = self.critic_1(s, a).view(-1)
-        q2 = self.critic_2(s, a).view(-1)
-
-        critic_1_loss = 0.5 * F.mse_loss(q1, y)
-        critic_2_loss = 0.5 * F.mse_loss(q2, y)
-        critic_loss = critic_1_loss + critic_2_loss
-
-        critic_loss.backward()
-        self.critic_1.optimizer.step()
-        self.critic_2.optimizer.step()      
-        
-        ########################
-        ### UPDATE ACTOR (π) ###
-        ########################
-        # minimize E[ α logπ - min(Q1,Q2)(s, a_pi) ]
-        self.actor.optimizer.zero_grad()
-
-        if self.policy_type == "dirichlet":
-            a_pi, logp_pi = self.actor.sample_dirichlet(s, reparameterize=True)
+            # Log alpha for optimization (log for numerical stability)
+            self.log_alpha = torch.tensor(np.log(alpha), dtype=torch.float32, 
+                                         device=device, requires_grad=True)
+            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=learning_rate)
+            self.alpha = self.log_alpha.exp().item()
         else:
-            a_pi, logp_pi = self.actor.sample_normal(s, reparameterize=True)
-
-        q1_pi = self.critic_1(s, a_pi).view(-1)
-        q2_pi = self.critic_2(s, a_pi).view(-1)
-        q_pi_min = T.min(q1_pi, q2_pi)
+            self.alpha = alpha
         
-        # Detach alpha in the actor loss; alpha is updated by its own objective
-        actor_loss = (alpha.detach() * logp_pi.view(-1) - q_pi_min).mean()
-
-        actor_loss.backward()
-        T.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-        self.actor.optimizer.step()
+        # Initialize replay buffer
+        self.replay_buffer = ReplayBuffer(n_input, n_action, buffer_size, device)
         
-        ##############################
-        ### UPDATE TEMPERATURE (α) ###
-        ##############################
-        # minimize J(α) = E[ -α (logπ + target_entropy) ]
-        # logp_pi = log probability of the sampled action
-        # log_alpha = learnable log temperature parameter
-        # Gradient flow (forward): Actor → logp_pi → alpha_loss → log_alpha
-        # detach gradient from logp_pi, so when we do backward(), the gradient doesn't flow into Actor
-        alpha_loss = -(self.log_alpha * (logp_pi.detach().view(-1) + self.target_entropy)).mean()
+        # Training state
+        self.global_step = 0
         
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
+    def np2torch(self, a, dtype=torch.float32):
+        """Convert numpy array to torch tensor"""
+        return torch.as_tensor(a, dtype=dtype, device=self.device)
+    
+    def select_action(self, state, evaluate=False):
+        """
+        Select action given state
         
+        Args:
+            state: Current state
+            evaluate: If True, use deterministic action (mean)
+            
+        Returns:
+            action: Numpy array of portfolio weights
+        """
+        # Flatten state
+        if isinstance(state, np.ndarray):
+            state = state.flatten()
         
-        #################################
-        ### SOFT UPDATE CRITIC TARGET ###
-        #################################
-        self.soft_update_targets()
+        state_tensor = torch.as_tensor(state, dtype=torch.float32, 
+                                        device=self.device).unsqueeze(0)
         
-        #return scalars for logging
-        return {
-            "alpha": float(alpha.item()),
-            "actor_loss": float(actor_loss.item()),
-            "alpha_loss": float(alpha_loss.item()),
-            "critic_loss": float(critic_loss.item())
+        with torch.no_grad():
+            if evaluate:
+                # Deterministic action for evaluation
+                action = self.policy.get_deterministic_action(state_tensor)
+            else:
+                # Stochastic action for exploration
+                action, _, _ = self.policy.sample(state_tensor, self.device)
+        
+        return action.squeeze().cpu().numpy()
+    
+    def update(self):
+        """
+        Perform one SAC update step
+        
+        Returns:
+            Dictionary of losses for logging
+        """
+        if not self.replay_buffer.is_ready(self.batch_size):
+            return None
+        
+        # Sample batch from replay buffer
+        batch = self.replay_buffer.sample(self.batch_size)
+        states = batch['states']
+        actions = batch['actions']
+        rewards = batch['rewards']
+        next_states = batch['next_states']
+        dones = batch['dones']
+        
+        # === Update Value Network ===
+        with torch.no_grad():
+            # Sample actions from current policy for next states
+            next_actions, next_log_probs, _ = self.policy.sample(next_states, self.device)
+            
+            # Compute Q-values for next state-action pairs
+            next_q1 = self.q1_target(next_states, next_actions)
+            next_q2 = self.q2_target(next_states, next_actions)
+            next_q = torch.min(next_q1, next_q2)
+            
+            # Target value: Q - alpha * log_pi
+            target_value = next_q - self.alpha * next_log_probs.unsqueeze(-1)
+        
+        # Current value estimate
+        current_value = self.value(states)
+        value_loss = F.mse_loss(current_value, target_value)
+        
+        self.value_optimizer.zero_grad()
+        value_loss.backward()
+        self.value_optimizer.step()
+        
+        # === Update Q-Networks ===
+        with torch.no_grad():
+            # Use value target for computing Q targets
+            target_v = self.value_target(next_states)
+            q_target = rewards + self.gamma * (1 - dones) * target_v
+        
+        # Current Q estimates
+        q1_pred = self.q1(states, actions)
+        q2_pred = self.q2(states, actions)
+        
+        q1_loss = F.mse_loss(q1_pred, q_target)
+        q2_loss = F.mse_loss(q2_pred, q_target)
+        
+        self.q1_optimizer.zero_grad()
+        q1_loss.backward()
+        self.q1_optimizer.step()
+        
+        self.q2_optimizer.zero_grad()
+        q2_loss.backward()
+        self.q2_optimizer.step()
+        
+        # === Update Policy Network ===
+        # Sample new actions from current policy
+        new_actions, log_probs, _ = self.policy.sample(states, self.device)
+        
+        # Compute Q-values for new actions
+        q1_new = self.q1(states, new_actions)
+        q2_new = self.q2(states, new_actions)
+        q_new = torch.min(q1_new, q2_new)
+        
+        # Policy loss: maximize Q - alpha * log_pi
+        # Equivalently: minimize alpha * log_pi - Q
+        policy_loss = (self.alpha * log_probs.unsqueeze(-1) - q_new).mean()
+        
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        self.policy_optimizer.step()
+        
+        # === Update Alpha (entropy temperature) ===
+        alpha_loss = None
+        if self.auto_entropy_tuning:
+            # Alpha loss: minimize -alpha * (log_pi + target_entropy)
+            with torch.no_grad():
+                _, log_probs_alpha, _ = self.policy.sample(states, self.device)
+            
+            alpha_loss = -(self.log_alpha * (log_probs_alpha + self.target_entropy)).mean()
+            
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            
+            self.alpha = self.log_alpha.exp().item()
+        
+        # === Soft Update Target Networks ===
+        self._soft_update(self.value, self.value_target)
+        self._soft_update(self.q1, self.q1_target)
+        self._soft_update(self.q2, self.q2_target)
+        
+        # Return losses for logging
+        losses = {
+            'q1_loss': q1_loss.item(),
+            'q2_loss': q2_loss.item(),
+            'policy_loss': policy_loss.item(),
+            'value_loss': value_loss.item(),
+            'alpha': self.alpha
         }
-
-    def soft_update_targets(self, tau=None):
-        if tau is None:
-            tau = self.tau
-
-        with T.no_grad():
-            for p_t, p in zip(self.critic_1_target.parameters(), self.critic_1.parameters()):
-                p_t.data.mul_(1.0 - tau).add_(tau * p.data)
-            for p_t, p in zip(self.critic_2_target.parameters(), self.critic_2.parameters()):
-                p_t.data.mul_(1.0 - tau).add_(tau * p.data)
-
-    def save_models(self):
-        print(".... saving models ....")
-        self.actor.save_checkpoint()
-        self.critic_1.save_checkpoint()
-        self.critic_2.save_checkpoint()
-        # save targets too (optional, but useful for exact restarts)
-        T.save(self.critic_1_target.state_dict(), self.critic_1.checkpoint_file + "_target")
-        T.save(self.critic_2_target.state_dict(), self.critic_2.checkpoint_file + "_target")
-        # temperature
-        T.save({"log_alpha": self.log_alpha.detach().cpu()}, "alpha_checkpoint.pt")
-
-    def load_models(self):
-        print(".... loading models ....")
-        self.actor.load_checkpoint()
-        self.critic_1.load_checkpoint()
-        self.critic_2.load_checkpoint()
-        # load targets if present; else hard-copy from online
-        try:
-            self.critic_1_target.load_state_dict(T.load(self.critic_1.checkpoint_file + "_target", map_location=self.critic_1.device))
-            self.critic_2_target.load_state_dict(T.load(self.critic_2.checkpoint_file + "_target", map_location=self.critic_2.device))
-        except Exception:
-            self.critic_1_target.load_state_dict(self.critic_1.state_dict())
-            self.critic_2_target.load_state_dict(self.critic_2.state_dict())
-        # load alpha
-        try:
-            payload = T.load("alpha_checkpoint.pt", map_location=self.critic_1.device)
-            self.log_alpha = payload["log_alpha"].to(self.critic_1.device)
-            self.log_alpha.requires_grad_(True)
-        except Exception:
-            pass
+        if alpha_loss is not None:
+            losses['alpha_loss'] = alpha_loss.item()
+        
+        return losses
+    
+    def _soft_update(self, source, target):
+        """Soft update target network: θ_target = τ*θ_source + (1-τ)*θ_target"""
+        for param, target_param in zip(source.parameters(), target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+    
+    def learn(self, env, total_timesteps):
+        """
+        Main training loop
+        
+        Args:
+            env: Training environment
+            total_timesteps: Total number of environment steps
+            
+        Returns:
+            episode_returns: List of returns per episode
+            losses: List of loss dictionaries
+            best_model_state: State dict of best model
+        """
+        episode_returns = []
+        losses = []
+        
+        # Track best model
+        best_avg_return = -np.inf
+        best_model_state = None
+        
+        start_time = time.time()
+        obs = env.reset()
+        episode_return = 0
+        episode_count = 0
+        
+        for step in range(total_timesteps):
+            self.global_step = step
+            
+            # Select action
+            if step < self.learning_starts:
+                # Random action during warmup
+                action = np.random.dirichlet(np.ones(self.n_action))
+            else:
+                action = self.select_action(obs, evaluate=False)
+            
+            # Take action in environment
+            next_obs, reward, done = env.step(action)
+            episode_return += reward
+            
+            # Handle terminal state
+            if done and len(next_obs) == 0:
+                # Environment returned empty state at episode end
+                # Store with zeros for next_obs
+                next_obs_flat = np.zeros_like(obs.flatten())
+            else:
+                next_obs_flat = next_obs
+            
+            # Store transition in replay buffer
+            self.replay_buffer.add(obs, action, reward, next_obs_flat, done)
+            
+            # Update networks
+            if step >= self.learning_starts and step % self.update_frequency == 0:
+                loss_dict = self.update()
+                if loss_dict is not None:
+                    losses.append(loss_dict)
+            
+            # Logging
+            if step % 1000 == 0:
+                progress = (step / total_timesteps) * 100
+                elapsed = time.time() - start_time
+                steps_per_sec = step / elapsed if elapsed > 0 else 0
+                print(f"Current Portfolio: {action}")
+                print(f'[{progress:5.1f}%] Step {step:6d}: {steps_per_sec:4.0f} steps/s | '
+                      f'Device: {self.device} | Alpha: {self.alpha:.4f}')
+            
+            # Episode done
+            if done:
+                episode_count += 1
+                episode_returns.append(episode_return)
+                print(f"global_step={step}, episode={episode_count}, episode_return={episode_return:.4f}")
+                
+                # Track best model
+                if len(episode_returns) >= 10:
+                    avg_return = np.mean(episode_returns[-10:])
+                    
+                    if avg_return > best_avg_return:
+                        best_avg_return = avg_return
+                        best_model_state = {
+                            'policy_state_dict': {k: v.cpu().clone() 
+                                                  for k, v in self.policy.state_dict().items()},
+                            'q1_state_dict': {k: v.cpu().clone() 
+                                             for k, v in self.q1.state_dict().items()},
+                            'q2_state_dict': {k: v.cpu().clone() 
+                                             for k, v in self.q2.state_dict().items()},
+                            'value_state_dict': {k: v.cpu().clone() 
+                                                for k, v in self.value.state_dict().items()},
+                            'episode': episode_count,
+                            'global_step': step,
+                            'avg_return': avg_return,
+                            'alpha': self.alpha,
+                            'all_returns': episode_returns.copy()
+                        }
+                        # Save best model immediately
+                        torch.save(best_model_state, "models/sac_portfolio_best.pth")
+                        print(f"  ✓ New best model! Avg return (last 10 episodes): {avg_return:.4f}")
+                        print(f"    → Saved to models/sac_portfolio_best.pth")
+                
+                # Reset episode
+                episode_return = 0
+                obs = env.reset()
+            else:
+                obs = next_obs
+        
+        return episode_returns, losses, best_model_state
+    
+    def choose_action_deterministic(self, observation):
+        """Deterministic action selection for evaluation"""
+        return self.select_action(observation, evaluate=True)
+    
+    def choose_action_stochastic(self, observation):
+        """Stochastic action selection"""
+        return self.select_action(observation, evaluate=False)
+    
+    def save_model(self, path):
+        """Save the trained model"""
+        state = {
+            'policy_state_dict': self.policy.state_dict(),
+            'q1_state_dict': self.q1.state_dict(),
+            'q2_state_dict': self.q2.state_dict(),
+            'value_state_dict': self.value.state_dict(),
+            'q1_target_state_dict': self.q1_target.state_dict(),
+            'q2_target_state_dict': self.q2_target.state_dict(),
+            'value_target_state_dict': self.value_target.state_dict(),
+            'alpha': self.alpha,
+            'log_alpha': self.log_alpha.item() if self.auto_entropy_tuning else None
+        }
+        torch.save(state, path)
+        print(f"Model saved to {path}")
+    
+    def load_model(self, path):
+        """Load a trained model"""
+        state = torch.load(path, map_location=self.device, weights_only=False)
+        
+        # Handle both old format (just policy dict) and new format (full state)
+        if 'policy_state_dict' in state:
+            self.policy.load_state_dict(state['policy_state_dict'])
+            if 'q1_state_dict' in state:
+                self.q1.load_state_dict(state['q1_state_dict'])
+            if 'q2_state_dict' in state:
+                self.q2.load_state_dict(state['q2_state_dict'])
+            if 'value_state_dict' in state:
+                self.value.load_state_dict(state['value_state_dict'])
+            if 'alpha' in state:
+                self.alpha = state['alpha']
+        else:
+            # Assume it's just the policy state dict
+            self.policy.load_state_dict(state)
+        
+        print(f"Model loaded from {path}")
+    
+    def load_best_model(self, best_model_state):
+        """Load the best model from training"""
+        if best_model_state is not None:
+            self.policy.load_state_dict(best_model_state['policy_state_dict'])
+            self.q1.load_state_dict(best_model_state['q1_state_dict'])
+            self.q2.load_state_dict(best_model_state['q2_state_dict'])
+            self.value.load_state_dict(best_model_state['value_state_dict'])
+            print(f"Best model loaded (Episode {best_model_state['episode']}, "
+                  f"Avg Return: {best_model_state['avg_return']:.4f})")
+        else:
+            print("No best model state available")
