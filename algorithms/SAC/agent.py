@@ -10,7 +10,6 @@ from torch.distributions import Dirichlet
 from networks import SoftQNetwork, PolicyNetwork, ValueNetwork
 from replay_buffer import ReplayBuffer
 
-
 class Agent:
     """
     Soft Actor-Critic (SAC) Agent for Portfolio Management
@@ -171,17 +170,18 @@ class Agent:
         dones = batch['dones']
         
         # === Update Value Network ===
+        # V(s) should fit: E_{a~pi}[ min(Q1(s,a), Q2(s,a)) - alpha * log pi(a|s) ]
         with torch.no_grad():
-            # Sample actions from current policy for next states
-            next_actions, next_log_probs, _ = self.policy.sample(next_states, self.device)
-            
-            # Compute Q-values for next state-action pairs
-            next_q1 = self.q1_target(next_states, next_actions)
-            next_q2 = self.q2_target(next_states, next_actions)
-            next_q = torch.min(next_q1, next_q2)
-            
-            # Target value: Q - alpha * log_pi
-            target_value = next_q - self.alpha * next_log_probs.unsqueeze(-1)
+            # Sample actions from current policy for CURRENT states
+            current_actions, current_log_probs, _ = self.policy.sample(states, self.device)
+
+            # Compute Q-values for current state-action pairs
+            current_q1 = self.q1(states, current_actions)
+            current_q2 = self.q2(states, current_actions)
+            current_q = torch.min(current_q1, current_q2)
+
+            # Target value: Q(s,a) - alpha * log_pi(a|s)
+            target_value = current_q - self.alpha * current_log_probs.unsqueeze(-1)
         
         # Current value estimate
         current_value = self.value(states)
@@ -312,7 +312,7 @@ class Agent:
                 # Store with zeros for next_obs
                 next_obs_flat = np.zeros_like(obs.flatten())
             else:
-                next_obs_flat = next_obs
+                next_obs_flat = next_obs.flatten()
             
             # Store transition in replay buffer
             self.replay_buffer.add(obs, action, reward, next_obs_flat, done)
