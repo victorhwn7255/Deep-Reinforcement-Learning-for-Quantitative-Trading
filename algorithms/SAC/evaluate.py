@@ -393,11 +393,12 @@ while True:
         
         sac_rewards = np.array(sac_rewards)
         sac_actions = np.array(sac_actions)
-        
-        # Calculate metrics
-        sac_cumulative = np.cumprod(np.exp(sac_rewards))
+
+        # Calculate metrics (reward = log1p(net_return))
+        sac_daily = np.expm1(sac_rewards)  # arithmetic daily net returns
+        sac_cumulative = np.cumprod(1.0 + sac_daily)
         sac_total_return = sac_cumulative[-1] - 1
-        sac_sharpe = np.mean(sac_rewards) / (np.std(sac_rewards) + 1e-8) * np.sqrt(252)
+        sac_sharpe = np.mean(sac_daily) / (np.std(sac_daily) + 1e-8) * np.sqrt(252)
         
         # Maximum drawdown
         sac_running_max = np.maximum.accumulate(sac_cumulative)
@@ -438,10 +439,11 @@ while True:
         sac_rewards = np.array(sac_rewards)
         sac_actions = np.array(sac_actions)
         
-        # Calculate metrics
-        sac_cumulative = np.cumprod(np.exp(sac_rewards))
+        # Calculate metrics (reward = log1p(net_return))
+        sac_daily = np.expm1(sac_rewards)
+        sac_cumulative = np.cumprod(1.0 + sac_daily)
         sac_total_return = sac_cumulative[-1] - 1
-        sac_sharpe = np.mean(sac_rewards) / (np.std(sac_rewards) + 1e-8) * np.sqrt(252)
+        sac_sharpe = np.mean(sac_daily) / (np.std(sac_daily) + 1e-8) * np.sqrt(252)
         
         # Maximum drawdown
         sac_running_max = np.maximum.accumulate(sac_cumulative)
@@ -496,10 +498,11 @@ while True:
             run_actions = np.array(run_actions)
             
             # Calculate metrics for this run
-            run_cumulative = np.cumprod(np.exp(run_rewards))
+            run_daily = np.expm1(run_rewards)
+            run_cumulative = np.cumprod(1.0 + run_daily)
             run_return = run_cumulative[-1] - 1
-            run_sharpe = np.mean(run_rewards) / (np.std(run_rewards) + 1e-8) * np.sqrt(252)
-            run_volatility = np.std(run_rewards) * np.sqrt(252)
+            run_sharpe = np.mean(run_daily) / (np.std(run_daily) + 1e-8) * np.sqrt(252)
+            run_volatility = np.std(run_daily) * np.sqrt(252)
             
             run_running_max = np.maximum.accumulate(run_cumulative)
             run_drawdown = (run_cumulative - run_running_max) / run_running_max
@@ -537,9 +540,10 @@ while True:
         sac_actions = all_actions_list[median_idx]
         
         # Recalculate for median run (for visualization)
-        sac_cumulative = np.cumprod(np.exp(sac_rewards))
+        sac_daily = np.expm1(sac_rewards)
+        sac_cumulative = np.cumprod(1.0 + sac_daily)
         sac_total_return = sac_cumulative[-1] - 1
-        sac_sharpe = np.mean(sac_rewards) / (np.std(sac_rewards) + 1e-8) * np.sqrt(252)
+        sac_sharpe = np.mean(sac_daily) / (np.std(sac_daily) + 1e-8) * np.sqrt(252)
         sac_running_max = np.maximum.accumulate(sac_cumulative)
         sac_drawdown = (sac_cumulative - sac_running_max) / sac_running_max
         sac_max_drawdown = np.min(sac_drawdown)
@@ -562,9 +566,10 @@ while True:
         benchmark_rewards.append(reward)
     
     benchmark_rewards = np.array(benchmark_rewards)
-    benchmark_cumulative = np.cumprod(np.exp(benchmark_rewards))
+    benchmark_daily = np.expm1(benchmark_rewards)
+    benchmark_cumulative = np.cumprod(1.0 + benchmark_daily)
     benchmark_total_return = benchmark_cumulative[-1] - 1
-    benchmark_sharpe = np.mean(benchmark_rewards) / (np.std(benchmark_rewards) + 1e-8) * np.sqrt(252)
+    benchmark_sharpe = np.mean(benchmark_daily) / (np.std(benchmark_daily) + 1e-8) * np.sqrt(252)
     
     # Maximum drawdown
     benchmark_running_max = np.maximum.accumulate(benchmark_cumulative)
@@ -661,7 +666,7 @@ while True:
         print(f"  Total Return:      {sac_total_return*100:>8.2f}%")
         print(f"  Sharpe Ratio:      {sac_sharpe:>8.4f}")
         print(f"  Max Drawdown:      {sac_max_drawdown*100:>8.2f}%")
-        print(f"  Ann. Volatility:   {np.std(sac_rewards)*np.sqrt(252)*100:>8.2f}%")
+        print(f"  Ann. Volatility:   {np.std(np.expm1(sac_rewards))*np.sqrt(252)*100:>8.2f}%")
     
     print("\n" + "-"*60)
     print("BENCHMARK (VNQ:10% SPY:50% TLT:30% GLD:5% BTC:5%)")
@@ -669,7 +674,7 @@ while True:
     print(f"  Total Return:      {benchmark_total_return*100:>8.2f}%")
     print(f"  Sharpe Ratio:      {benchmark_sharpe:>8.4f}")
     print(f"  Max Drawdown:      {benchmark_max_drawdown*100:>8.2f}%")
-    print(f"  Ann. Volatility:   {np.std(benchmark_rewards)*np.sqrt(252)*100:>8.2f}%")
+    print(f"  Ann. Volatility:   {np.std(np.expm1(benchmark_rewards))*np.sqrt(252)*100:>8.2f}%")
     
     print("\n" + "-"*60)
     print("COMPARISON (SAC vs Benchmark)")
@@ -742,8 +747,8 @@ while True:
             ax3.set_title('Total Return Distribution', fontsize=12, fontweight='bold')
             ax3.set_xlabel('Total Return (%)')
         else:
-            ax3.hist(sac_rewards*100, bins=50, alpha=0.5, label='SAC', density=True, color='blue')
-            ax3.hist(benchmark_rewards*100, bins=50, alpha=0.5, label='Benchmark', 
+            ax3.hist(np.expm1(sac_rewards)*100, bins=50, alpha=0.5, label='SAC', density=True, color='blue')
+            ax3.hist(np.expm1(benchmark_rewards)*100, bins=50, alpha=0.5, label='Benchmark',
                     density=True, color='orange')
             ax3.set_title('Daily Returns Distribution', fontsize=12, fontweight='bold')
             ax3.set_xlabel('Daily Return (%)')
