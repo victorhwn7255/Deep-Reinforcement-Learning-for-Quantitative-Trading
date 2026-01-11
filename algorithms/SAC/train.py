@@ -29,7 +29,7 @@ gamma = 0.99
 tau = 0.005                    # Soft update coefficient
 alpha = 0.2                    # Initial entropy coefficient
 auto_entropy_tuning = True     # Automatically tune alpha
-buffer_size = 1000000          # Replay buffer size
+buffer_size = 300000          # Replay buffer size
 batch_size = 256               # Batch size for updates
 learning_starts = 3900        # Steps before starting to learn
 update_frequency = 1           # How often to update networks
@@ -379,10 +379,24 @@ print(f"✓ Final model saved to: {model_path_final}")
 if best_model_state is not None:
     torch.save(best_model_state, model_path_best)
     print(f"✓ Best model saved to: {model_path_best}")
-    print(f"  - Episode: {best_model_state['episode']}")
-    print(f"  - Global step: {best_model_state['global_step']}")
-    print(f"  - Avg return (last 10 episodes): {best_model_state['avg_return']:.4f}")
-    print(f"  - Final alpha: {best_model_state['alpha']:.4f}")
+    # Use .get() to avoid post-training crashes if any keys are missing
+    best_episode = best_model_state.get('episode', 'N/A')
+    best_global_step = best_model_state.get('global_step', 'N/A')
+    best_avg_return = best_model_state.get('avg_return', None)
+    best_alpha = best_model_state.get('alpha', None)
+
+    print(f"  - Episode: {best_episode}")
+    print(f"  - Global step: {best_global_step}")
+
+    if best_avg_return is not None:
+        print(f"  - Avg return (last 10 episodes): {best_avg_return:.4f}")
+    else:
+        print("  - Avg return (last 10 episodes): N/A")
+
+    if best_alpha is not None:
+        print(f"  - Final alpha: {best_alpha:.4f}")
+    else:
+        print("  - Final alpha: N/A")
 else:
     print("⚠ No best model was saved (training may have been too short)")
 

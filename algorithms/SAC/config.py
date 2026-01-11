@@ -1,14 +1,6 @@
-"""
-Centralized configuration for SAC Portfolio Management.
-
-This file contains all hyperparameters, data settings, and training configurations.
-Modify values here to run different experiments without changing core code.
-"""
-
 from dataclasses import dataclass
 from typing import List
 import torch
-
 
 @dataclass
 class DataConfig:
