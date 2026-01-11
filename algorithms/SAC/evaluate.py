@@ -1,453 +1,402 @@
-"""
-SAC portfolio evaluation/backtest (Config-driven).
-
-Goals:
-- No train/eval feature drift: feature engineering is centralized in data_utils.py.
-- No hard-coded hyperparams: uses Config (config.py) everywhere.
-- Same env mechanics as training: uses cfg.env.
-- Loads best/final model based on cfg.eval.model_preference.
-
-Run:
-  python evaluate.py
-"""
-
 from __future__ import annotations
 
 import os
-import json
 import random
-from dataclasses import asdict
-from typing import Dict, Any, Optional, Tuple, List
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 
-from config import Config, get_default_config
-from data_utils import build_feature_dataframe, split_train_test
+from config import get_default_config, Config
+from data_utils import load_and_prepare_data
 from environment import Env
 from agent import Agent
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Utilities
-# -----------------------------------------------------------------------------
+# =============================================================================
 
-def set_global_seeds(seed: int) -> None:
+def ensure_dir(path: str) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+def set_all_seeds(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        try:
+            torch.mps.manual_seed(seed)  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
+def equity_curve(daily_net_returns: np.ndarray) -> np.ndarray:
+    return np.cumprod(1.0 + daily_net_returns)
 
-def safe_makedirs(path: str) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+def sharpe(daily_net_returns: np.ndarray, ann: int = 252) -> float:
+    mu = float(np.mean(daily_net_returns))
+    sd = float(np.std(daily_net_returns))
+    return mu / (sd + 1e-12) * float(np.sqrt(ann))
 
+def max_drawdown(equity: np.ndarray) -> float:
+    rm = np.maximum.accumulate(equity)
+    dd = (equity - rm) / (rm + 1e-12)
+    return float(np.min(dd))
 
-def compute_performance_metrics(
-    daily_net_returns: np.ndarray,
-    daily_turnover: np.ndarray,
-    daily_tc_cost: np.ndarray,
-) -> Dict[str, float]:
-    """
-    daily_net_returns: arithmetic net returns (e.g. 0.001 for +0.1%)
-    daily_turnover: env.last_turnover (one-way if env uses half-factor)
-    daily_tc_cost: env.last_tc_cost (fraction drag applied that day)
-    """
-    eps = 1e-12
-    n = len(daily_net_returns)
-    if n == 0:
-        return {}
-
-    equity = np.cumprod(1.0 + daily_net_returns)
-    total_return = float(equity[-1] - 1.0)
-
-    ann_factor = 252.0
-    years = n / ann_factor
-    if years > 0:
-        annualized_return = float((1.0 + total_return) ** (1.0 / years) - 1.0)
-    else:
-        annualized_return = float("nan")
-
-    mean_daily = float(np.mean(daily_net_returns))
-    std_daily = float(np.std(daily_net_returns) + eps)
-
-    annualized_vol = float(std_daily * np.sqrt(ann_factor))
-    sharpe = float((mean_daily / std_daily) * np.sqrt(ann_factor))
-
-    # Max drawdown
-    running_max = np.maximum.accumulate(equity)
-    drawdown = (equity - running_max) / (running_max + eps)
-    max_drawdown = float(np.min(drawdown))
-
-    # Cost/turnover summaries
-    avg_turnover = float(np.mean(daily_turnover)) if len(daily_turnover) else float("nan")
-    total_turnover = float(np.sum(daily_turnover)) if len(daily_turnover) else float("nan")
-
-    avg_tc = float(np.mean(daily_tc_cost)) if len(daily_tc_cost) else float("nan")
-    total_tc = float(np.sum(daily_tc_cost)) if len(daily_tc_cost) else float("nan")
-
+def evaluate_metrics(daily_net_returns: np.ndarray) -> Dict[str, float]:
+    eq = equity_curve(daily_net_returns)
     return {
-        "n_days": float(n),
-        "total_return": total_return,
-        "annualized_return": annualized_return,
-        "annualized_vol": annualized_vol,
-        "sharpe": sharpe,
-        "max_drawdown": max_drawdown,
-        "avg_turnover": avg_turnover,
-        "total_turnover": total_turnover,
-        "avg_tc_cost": avg_tc,
-        "total_tc_cost": total_tc,
+        "total_return": float(eq[-1] - 1.0) if len(eq) else 0.0,
+        "sharpe": sharpe(daily_net_returns),
+        "ann_vol": float(np.std(daily_net_returns) * np.sqrt(252)),
+        "max_drawdown": max_drawdown(eq),
     }
 
-
-def run_backtest(
-    env: Env,
-    agent: Agent,
-    deterministic_policy: bool,
-) -> Dict[str, Any]:
-    obs = env.reset()
-
-    actions: List[np.ndarray] = []
-    net_returns: List[float] = []
-    gross_returns: List[float] = []
-    tc_costs: List[float] = []
-    turnovers: List[float] = []
-
-    done = False
-    while not done:
-        a = agent.select_action(obs, evaluate=deterministic_policy)
-        actions.append(a.copy())
-
-        obs, reward, done = env.step(a)
-
-        # Use environment trackers (more direct than inverting reward_scale * log1p)
-        net_returns.append(float(env.last_net_return))
-        gross_returns.append(float(env.last_gross_return))
-        tc_costs.append(float(env.last_tc_cost))
-        turnovers.append(float(env.last_turnover))
-
-    actions_arr = np.asarray(actions, dtype=np.float32)
-    net_arr = np.asarray(net_returns, dtype=np.float64)
-    gross_arr = np.asarray(gross_returns, dtype=np.float64)
-    tc_arr = np.asarray(tc_costs, dtype=np.float64)
-    turn_arr = np.asarray(turnovers, dtype=np.float64)
-
-    equity = np.cumprod(1.0 + net_arr)
-    metrics = compute_performance_metrics(net_arr, turn_arr, tc_arr)
-
-    return {
-        "actions": actions_arr,
-        "daily_net_returns": net_arr,
-        "daily_gross_returns": gross_arr,
-        "daily_tc_cost": tc_arr,
-        "daily_turnover": turn_arr,
-        "equity_curve": equity,
-        "metrics": metrics,
-    }
-
-
-def plot_equity_and_drawdown(
-    dates: np.ndarray,
-    sac_equity: np.ndarray,
-    ew_equity: Optional[np.ndarray],
-    out_path: str,
-    title: str,
-) -> None:
-    safe_makedirs(out_path)
-
-    # Drawdown from equity
-    eps = 1e-12
-    sac_running_max = np.maximum.accumulate(sac_equity)
-    sac_dd = (sac_equity - sac_running_max) / (sac_running_max + eps)
-
-    if ew_equity is not None:
-        ew_running_max = np.maximum.accumulate(ew_equity)
-        ew_dd = (ew_equity - ew_running_max) / (ew_running_max + eps)
+def load_checkpoint(agent: Agent, path: str) -> None:
+    ckpt = torch.load(path, map_location=agent.device, weights_only=False)
+    if isinstance(ckpt, dict) and "policy_state_dict" in ckpt:
+        # best snapshot or full
+        try:
+            agent.load_best_model(ckpt)
+        except Exception:
+            agent.load_model(path)
     else:
-        ew_dd = None
+        agent.load_model(path)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
-
-    # Equity
-    ax1.plot(dates, sac_equity, label="SAC")
-    if ew_equity is not None:
-        ax1.plot(dates, ew_equity, label="Equal-Weight (daily rebalance)", alpha=0.8)
-    ax1.set_title(title)
-    ax1.set_ylabel("Equity (start=1.0)")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
-
-    # Drawdown
-    ax2.plot(dates, sac_dd, label="SAC")
-    if ew_dd is not None:
-        ax2.plot(dates, ew_dd, label="Equal-Weight (daily rebalance)", alpha=0.8)
-    ax2.axhline(0.0, linestyle="--", alpha=0.3)
-    ax2.set_ylabel("Drawdown")
-    ax2.set_xlabel("Date")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-    print(f"✓ Saved evaluation plot to: {out_path}")
-
-
-def assert_env_feature_compat(cfg: Config) -> None:
-    """
-    Your Env currently expects RSI + volatility + VIX + credit features always.
-    If you turn any family off in cfg.features, Env will raise missing columns.
-    """
-    req = {
-        "include_rsi": cfg.features.include_rsi,
-        "include_volatility": cfg.features.include_volatility,
-        "include_vix": cfg.features.include_vix,
-        "include_credit_spread": cfg.features.include_credit_spread,
-    }
-    missing = [k for k, v in req.items() if not v]
-    if missing:
-        raise ValueError(
-            "Env requires these feature families to be enabled, but config has them disabled: "
-            + ", ".join(missing)
-            + "\nEither: (1) keep them enabled, or (2) refactor environment.py to be config-driven."
-        )
-
-
-def resolve_model_path(cfg: Config) -> str:
-    prefer = (cfg.eval.model_preference or "best").lower().strip()
-    best_path = cfg.training.model_path_best
-    final_path = cfg.training.model_path_final
-
-    if prefer == "best":
-        if os.path.exists(best_path):
-            return best_path
-        if os.path.exists(final_path):
-            print(f"⚠ Best model not found at {best_path}. Falling back to final model.")
-            return final_path
-        raise FileNotFoundError(f"No model found at {best_path} or {final_path}")
-
-    if prefer == "final":
-        if os.path.exists(final_path):
-            return final_path
-        if os.path.exists(best_path):
-            print(f"⚠ Final model not found at {final_path}. Falling back to best model.")
-            return best_path
-        raise FileNotFoundError(f"No model found at {final_path} or {best_path}")
-
-    raise ValueError(f"cfg.eval.model_preference must be 'best' or 'final'. Got: {cfg.eval.model_preference}")
-
-
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
-
-def main(cfg: Optional[Config] = None) -> None:
-    cfg = cfg or get_default_config()
-
-    print("=" * 80)
-    print("SAC PORTFOLIO EVALUATION (CONFIG-DRIVEN)")
-    print("=" * 80)
-
-    cfg.ensure_output_dirs()
-    assert_env_feature_compat(cfg)
-
-    # Determinism for stochastic eval (if deterministic_policy=False, this still makes it repeatable)
-    set_global_seeds(cfg.training.seed)
-
-    # Device (same logic as training)
-    device = cfg.auto_detect_device()
-    print(f"✓ Device: {device}")
-
-    # ------------------------------------------------------------------
-    # Build dataset (same feature pipeline as training)
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 80)
-    print("STEP 1: BUILD FEATURE DATAFRAME")
-    print("=" * 80)
-
-    df = build_feature_dataframe(cfg)
-    df_train, df_test = split_train_test(df, cfg)
-
-    print(f"✓ Train rows: {len(df_train):,} | {df_train.index[0].date()} -> {df_train.index[-1].date()}")
-    print(f"✓ Test rows:  {len(df_test):,}  | {df_test.index[0].date()} -> {df_test.index[-1].date()}")
-
-    tickers = list(cfg.data.tickers or [])
-
-    # ------------------------------------------------------------------
-    # Create test environment with EXACT same mechanics as training
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 80)
-    print("STEP 2: CREATE TEST ENVIRONMENT")
-    print("=" * 80)
-
-    env_test = Env(
-        df=df_test,
-        tickers=tickers,
-        lag=cfg.env.lag,
-        tc_rate=cfg.env.tc_rate,
-        tc_fixed=cfg.env.tc_fixed,
-        turnover_threshold=cfg.env.turnover_threshold,
-        include_position_in_state=cfg.env.include_position_in_state,
-        turnover_include_cash=cfg.env.turnover_include_cash,
-        turnover_use_half_factor=cfg.env.turnover_use_half_factor,
-        reward_scale=cfg.env.reward_scale,
-    )
-
-    state_dim = env_test.get_state_dim()
-    action_dim = env_test.get_action_dim()
-    print(f"✓ state_dim={state_dim} | action_dim={action_dim}")
-
-    # ------------------------------------------------------------------
-    # Init agent (hyperparams should match training)
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 80)
-    print("STEP 3: INIT AGENT + LOAD MODEL")
-    print("=" * 80)
-
-    agent = Agent(
-        n_input=state_dim,
-        n_action=action_dim,
-        learning_rate=cfg.sac.actor_lr,         # Agent currently uses ONE shared LR
-        gamma=cfg.sac.gamma,
-        tau=cfg.sac.tau,
-        alpha=cfg.sac.alpha_init,
-        auto_entropy_tuning=cfg.sac.auto_entropy_tuning,
-        target_entropy=cfg.sac.target_entropy,  # OK if None (Agent will set a default)
-        buffer_size=cfg.sac.buffer_size,
-        batch_size=cfg.sac.batch_size,
-        learning_starts=cfg.sac.learning_starts,
-        update_frequency=cfg.sac.update_frequency,
-        n_hidden=cfg.network.n_hidden,
-        device=device,
-    )
-
-    model_path = resolve_model_path(cfg)
-    agent.load_model(model_path)
-
-    # eval mode
     agent.policy.eval()
     agent.q1.eval()
     agent.q2.eval()
     agent.value.eval()
 
-    mode = "DETERMINISTIC" if cfg.eval.deterministic_policy else "STOCHASTIC"
-    print(f"✓ Loaded model: {model_path}")
-    print(f"✓ Policy mode: {mode}")
 
-    # ------------------------------------------------------------------
-    # Run SAC backtest
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 80)
-    print("STEP 4: RUN BACKTEST (SAC)")
-    print("=" * 80)
+# =============================================================================
+# Rollout helpers
+# =============================================================================
 
-    sac_out = run_backtest(env_test, agent, deterministic_policy=cfg.eval.deterministic_policy)
-    sac_metrics = sac_out["metrics"]
+def run_policy_episode(env: Env, agent: Agent, deterministic: bool) -> Tuple[np.ndarray, np.ndarray]:
+    obs = env.reset()
+    done = False
 
-    # ------------------------------------------------------------------
-    # Run baseline: equal-weight daily rebalance (with same costs)
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 80)
-    print("STEP 5: RUN BASELINE (EQUAL-WEIGHT DAILY REBALANCE)")
-    print("=" * 80)
+    rets: List[float] = []
+    acts: List[np.ndarray] = []
 
-    env_ew = Env(
-        df=df_test,
-        tickers=tickers,
-        lag=cfg.env.lag,
-        tc_rate=cfg.env.tc_rate,
-        tc_fixed=cfg.env.tc_fixed,
-        turnover_threshold=cfg.env.turnover_threshold,
-        include_position_in_state=cfg.env.include_position_in_state,
-        turnover_include_cash=cfg.env.turnover_include_cash,
-        turnover_use_half_factor=cfg.env.turnover_use_half_factor,
-        reward_scale=cfg.env.reward_scale,
-    )
+    while not done:
+        a = agent.choose_action_deterministic(obs) if deterministic else agent.choose_action_stochastic(obs)
+        acts.append(a.copy())
+        obs, _, done = env.step(a)
 
-    # Equal weight across assets, zero cash
-    n_assets = len(tickers)
-    ew_action = np.zeros(n_assets + 1, dtype=np.float32)
-    ew_action[:n_assets] = 1.0 / max(1, n_assets)
-    ew_action[-1] = 0.0
+        if not hasattr(env, "last_net_return"):
+            raise RuntimeError("Env must expose env.last_net_return for evaluation.")
+        rets.append(float(env.last_net_return))
 
-    obs = env_ew.reset()
-    ew_net: List[float] = []
-    ew_turn: List[float] = []
-    ew_tc: List[float] = []
-    ew_done = False
-    while not ew_done:
-        obs, reward, ew_done = env_ew.step(ew_action)
-        ew_net.append(float(env_ew.last_net_return))
-        ew_turn.append(float(env_ew.last_turnover))
-        ew_tc.append(float(env_ew.last_tc_cost))
+    return np.asarray(rets, dtype=np.float64), np.asarray(acts, dtype=np.float64)
 
-    ew_net_arr = np.asarray(ew_net, dtype=np.float64)
-    ew_equity = np.cumprod(1.0 + ew_net_arr)
-    ew_metrics = compute_performance_metrics(
-        ew_net_arr,
-        np.asarray(ew_turn, dtype=np.float64),
-        np.asarray(ew_tc, dtype=np.float64),
-    )
+def run_benchmark_episode(env: Env, w: np.ndarray) -> np.ndarray:
+    obs = env.reset()
+    done = False
+    rets: List[float] = []
+    while not done:
+        obs, _, done = env.step(w)
+        rets.append(float(env.last_net_return))
+    return np.asarray(rets, dtype=np.float64)
 
-    # ------------------------------------------------------------------
-    # Print summary
-    # ------------------------------------------------------------------
-    def _fmt(x: Any) -> str:
-        if x is None:
-            return "N/A"
-        if isinstance(x, float):
-            return f"{x:.6f}"
-        return str(x)
 
-    print("\n" + "=" * 80)
-    print("RESULTS SUMMARY")
-    print("=" * 80)
+# =============================================================================
+# Plotting
+# =============================================================================
 
-    print("\nSAC:")
-    for k in ["total_return", "annualized_return", "annualized_vol", "sharpe", "max_drawdown", "avg_turnover", "total_tc_cost"]:
-        print(f"  {k:>16}: {_fmt(sac_metrics.get(k))}")
+def plot_eval(
+    cfg: Config,
+    dates: pd.DatetimeIndex,
+    sac_equity: np.ndarray,
+    bench_equity: np.ndarray,
+    sac_dd: np.ndarray,
+    bench_dd: np.ndarray,
+    sac_actions: np.ndarray,
+    tickers: List[str],
+    title: str,
+) -> Optional[str]:
+    if not cfg.evaluation.render_plots:
+        return None
 
-    print("\nEqual-Weight (daily rebalance):")
-    for k in ["total_return", "annualized_return", "annualized_vol", "sharpe", "max_drawdown", "avg_turnover", "total_tc_cost"]:
-        print(f"  {k:>16}: {_fmt(ew_metrics.get(k))}")
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
-    # ------------------------------------------------------------------
-    # Save artifacts (optional)
-    # ------------------------------------------------------------------
-    if cfg.eval.save_plots:
-        print("\n" + "=" * 80)
-        print("STEP 6: SAVE PLOT + JSON")
-        print("=" * 80)
+    # Equity
+    axes[0, 0].plot(dates[: len(sac_equity)], sac_equity, label="SAC", linewidth=2)
+    axes[0, 0].plot(dates[: len(bench_equity)], bench_equity, label="Benchmark", linestyle="--", linewidth=2)
+    axes[0, 0].set_title("Cumulative Equity")
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
 
-        dates = df_test.index.values[-len(sac_out["equity_curve"]):]  # align
-        title = f"SAC Evaluation ({mode}) | Model: {os.path.basename(model_path)}"
-        plot_equity_and_drawdown(
-            dates=dates,
-            sac_equity=sac_out["equity_curve"],
-            ew_equity=ew_equity,
-            out_path=cfg.eval.plots_path_eval,
-            title=title,
+    # Drawdown
+    axes[0, 1].plot(dates[: len(sac_dd)], sac_dd * 100.0, label="SAC DD")
+    axes[0, 1].plot(dates[: len(bench_dd)], bench_dd * 100.0, label="Bench DD", linestyle="--")
+    axes[0, 1].set_title("Drawdown (%)")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # SAC daily returns dist
+    sac_daily = np.diff(np.log(sac_equity + 1e-12))
+    axes[1, 0].hist(sac_daily, bins=50, alpha=0.8)
+    axes[1, 0].set_title("SAC Log-Return Distribution")
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Weights
+    names = tickers + ["CASH"]
+    for i in range(min(sac_actions.shape[1], len(names))):
+        axes[1, 1].plot(dates[: sac_actions.shape[0]], sac_actions[:, i], label=names[i], alpha=0.85)
+    axes[1, 1].set_title("Portfolio Weights")
+    axes[1, 1].set_ylim([0.0, 1.0])
+    axes[1, 1].legend(ncol=2, loc="upper right")
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.suptitle(title, fontsize=14)
+    plt.tight_layout()
+
+    out_path = None
+    if cfg.evaluation.save_plots:
+        ensure_dir(cfg.evaluation.output_dir)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = str(Path(cfg.evaluation.output_dir) / f"evaluation_{ts}.png")
+        plt.savefig(out_path, dpi=150)
+
+    plt.show()
+    return out_path
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    cfg = get_default_config()
+    cfg.ensure_dirs()
+    cfg.print_summary()
+
+    device = cfg.auto_detect_device()
+
+    df_train, df_test, feature_cols = load_and_prepare_data(cfg)
+
+    # Build env (prefer config-driven env signature)
+    try:
+        env_test = Env(df=df_test, tickers=cfg.data.tickers, cfg=cfg, feature_columns=feature_cols)
+    except TypeError:
+        # fallback if your Env doesn't accept cfg/feature_columns yet
+        env_test = Env(
+            df_test,
+            cfg.data.tickers,
+            lag=cfg.env.lag,
+            include_position_in_state=cfg.env.include_position_in_state,
         )
 
-        # Save metrics JSON
-        metrics_path = os.path.join(cfg.eval.plots_dir, "sac_evaluation_metrics.json")
-        safe_makedirs(metrics_path)
-        payload = {
-            "model_path": model_path,
-            "mode": mode,
-            "tickers": tickers,
-            "config": cfg.to_dict() if hasattr(cfg, "to_dict") else asdict(cfg),
-            "sac_metrics": sac_metrics,
-            "equal_weight_metrics": ew_metrics,
-        }
-        with open(metrics_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        print(f"✓ Saved evaluation metrics: {metrics_path}")
+    # Infer dims
+    obs0 = env_test.reset()
+    state_dim = int(np.asarray(obs0).reshape(-1).shape[0])
+    action_dim = int(len(cfg.data.tickers) + 1)
 
-    print("\nDone.")
+    agent = Agent(n_input=state_dim, n_action=action_dim, cfg=cfg, device=device)
+
+    current_model_path = cfg.evaluation.model_path
+    if os.path.exists(current_model_path):
+        load_checkpoint(agent, current_model_path)
+        print(f"\n✓ Loaded model: {current_model_path}")
+    else:
+        print(f"\n⚠ Model not found at cfg.evaluation.model_path: {current_model_path}")
+        print("  Use menu option 4 to load a different checkpoint.")
+
+    # Benchmark weights (must match (assets + cash))
+    benchmark_weights = np.array([0.10, 0.50, 0.30, 0.05, 0.05, 0.00], dtype=np.float32)
+    if benchmark_weights.shape[0] != action_dim:
+        raise ValueError(f"Benchmark dim mismatch: expected {action_dim}, got {benchmark_weights.shape[0]}")
+
+    dates = df_test.index
+
+    while True:
+        print("\n" + "=" * 60)
+        print("EVALUATION MENU")
+        print("=" * 60)
+        print("\nWhat would you like to do?")
+        print("  1. Run deterministic evaluation")
+        print("  2. Run stochastic evaluation (with seed)")
+        print("  3. Run multiple stochastic evaluations (statistical analysis)")
+        print("  4. Switch to different model")
+        print("  5. Exit")
+
+        menu_choice = input("\nEnter choice (1-5): ").strip()
+
+        if menu_choice == "5":
+            print("\n" + "=" * 60)
+            print("Exiting evaluation script. Goodbye!")
+            print("=" * 60)
+            break
+
+        if menu_choice == "4":
+            print("\n" + "=" * 60)
+            print("SWITCH MODEL")
+            print("=" * 60)
+            print("\nWhich model do you want to load?")
+            print(f"  1. Best model  ({cfg.training.model_path_best})")
+            print(f"  2. Final model ({cfg.training.model_path_final})")
+            print("  3. Custom path")
+
+            ch = input("Enter choice (1-3): ").strip()
+            if ch == "1":
+                path = cfg.training.model_path_best
+            elif ch == "2":
+                path = cfg.training.model_path_final
+            elif ch == "3":
+                path = input("Enter model path: ").strip()
+            else:
+                print("✗ Invalid choice.")
+                continue
+
+            if not os.path.exists(path):
+                print(f"⚠ Not found: {path}")
+                continue
+
+            load_checkpoint(agent, path)
+            current_model_path = path
+            print(f"✓ Switched model: {current_model_path}")
+            continue
+
+        if menu_choice not in ["1", "2", "3"]:
+            print("✗ Invalid choice.")
+            continue
+
+        show_stats = False
+        display_mode = ""
+        sac_daily = None
+        sac_actions = None
+
+        if menu_choice == "1":
+            display_mode = "Deterministic (Dirichlet mean)"
+            sac_daily, sac_actions = run_policy_episode(env_test, agent, deterministic=True)
+
+        elif menu_choice == "2":
+            seed_in = input("Seed (default 42): ").strip()
+            seed = int(seed_in) if seed_in else 42
+            set_all_seeds(seed)
+            display_mode = f"Stochastic (seed={seed})"
+            sac_daily, sac_actions = run_policy_episode(env_test, agent, deterministic=False)
+
+        elif menu_choice == "3":
+            show_stats = True
+            n_in = input("How many runs? (default 10, max 100): ").strip()
+            try:
+                n_runs = int(n_in) if n_in else 10
+                n_runs = max(1, min(n_runs, 100))
+            except ValueError:
+                n_runs = 10
+
+            display_mode = f"Multiple runs (n={n_runs})"
+            base_seed = int(cfg.experiment.seed)
+
+            all_returns, all_sharpes, all_dd, all_vol = [], [], [], []
+            daily_runs, action_runs = [], []
+
+            for r in range(n_runs):
+                set_all_seeds(base_seed + r + 1)
+                d, a = run_policy_episode(env_test, agent, deterministic=False)
+                m = evaluate_metrics(d)
+                all_returns.append(m["total_return"])
+                all_sharpes.append(m["sharpe"])
+                all_dd.append(m["max_drawdown"])
+                all_vol.append(m["ann_vol"])
+                daily_runs.append(d)
+                action_runs.append(a)
+
+            all_returns = np.asarray(all_returns, dtype=np.float64)
+            all_sharpes = np.asarray(all_sharpes, dtype=np.float64)
+            all_dd = np.asarray(all_dd, dtype=np.float64)
+            all_vol = np.asarray(all_vol, dtype=np.float64)
+
+            median_idx = int(np.argsort(all_returns)[len(all_returns) // 2])
+            sac_daily = daily_runs[median_idx]
+            sac_actions = action_runs[median_idx]
+
+        # Benchmark
+        bench_daily = run_benchmark_episode(env_test, benchmark_weights)
+
+        # Metrics
+        sac_m = evaluate_metrics(sac_daily)
+        bench_m = evaluate_metrics(bench_daily)
+
+        sac_eq = equity_curve(sac_daily)
+        bench_eq = equity_curve(bench_daily)
+        sac_dd_series = (sac_eq - np.maximum.accumulate(sac_eq)) / (np.maximum.accumulate(sac_eq) + 1e-12)
+        bench_dd_series = (bench_eq - np.maximum.accumulate(bench_eq)) / (np.maximum.accumulate(bench_eq) + 1e-12)
+
+        # Print
+        print("\n" + "=" * 60)
+        print("TEST SET PERFORMANCE")
+        print("=" * 60)
+        print(f"Model: {current_model_path}")
+        print(f"Mode : {display_mode}")
+
+        if show_stats:
+            print("\n" + "-" * 60)
+            print("SAC - STATISTICAL SUMMARY")
+            print("-" * 60)
+            print(f"Total Return (%): mean={np.mean(all_returns)*100:.2f}  std={np.std(all_returns)*100:.2f}  "
+                  f"min={np.min(all_returns)*100:.2f}  max={np.max(all_returns)*100:.2f}  median={np.median(all_returns)*100:.2f}")
+            print(f"Sharpe: mean={np.mean(all_sharpes):.4f}  std={np.std(all_sharpes):.4f}  "
+                  f"min={np.min(all_sharpes):.4f}  max={np.max(all_sharpes):.4f}")
+            print(f"Max DD (%): mean={np.mean(all_dd)*100:.2f}  worst={np.min(all_dd)*100:.2f}  best={np.max(all_dd)*100:.2f}")
+            print(f"Ann Vol (%): mean={np.mean(all_vol)*100:.2f}  std={np.std(all_vol)*100:.2f}")
+
+            prob_beat = float(np.mean(all_returns > bench_m["total_return"]) * 100.0)
+            prob_pos = float(np.mean(all_returns > 0.0) * 100.0)
+            print(f"P(beat benchmark)={prob_beat:.1f}%  P(positive)={prob_pos:.1f}%")
+
+        else:
+            print("\n" + "-" * 60)
+            print("SAC (single run)")
+            print("-" * 60)
+            print(f"  Total Return:    {sac_m['total_return']*100:8.2f}%")
+            print(f"  Sharpe Ratio:    {sac_m['sharpe']:8.4f}")
+            print(f"  Max Drawdown:    {sac_m['max_drawdown']*100:8.2f}%")
+            print(f"  Ann. Volatility: {sac_m['ann_vol']*100:8.2f}%")
+
+        print("\n" + "-" * 60)
+        print("BENCHMARK")
+        print("-" * 60)
+        print(f"  Total Return:    {bench_m['total_return']*100:8.2f}%")
+        print(f"  Sharpe Ratio:    {bench_m['sharpe']:8.4f}")
+        print(f"  Max Drawdown:    {bench_m['max_drawdown']*100:8.2f}%")
+        print(f"  Ann. Volatility: {bench_m['ann_vol']*100:8.2f}%")
+
+        print("\n" + "-" * 60)
+        print("COMPARISON (SAC vs Benchmark)")
+        print("-" * 60)
+        print(f"  Return diff:   {(sac_m['total_return'] - bench_m['total_return'])*100:+8.2f}%")
+        print(f"  Sharpe diff:   {(sac_m['sharpe'] - bench_m['sharpe']):+8.4f}")
+        print(f"  MaxDD diff:    {(sac_m['max_drawdown'] - bench_m['max_drawdown'])*100:+8.2f}%")
+
+        # Visualize
+        visualize = input("\nVisualize results? (y/n): ").strip().lower()
+        if visualize == "y":
+            title = f"SAC Evaluation ({display_mode}) | {dates[0].date()} → {dates[-1].date()}"
+            out = plot_eval(
+                cfg=cfg,
+                dates=dates,
+                sac_equity=sac_eq,
+                bench_equity=bench_eq,
+                sac_dd=sac_dd_series,
+                bench_dd=bench_dd_series,
+                sac_actions=sac_actions,
+                tickers=list(cfg.data.tickers),
+                title=title,
+            )
+            if out is not None:
+                print(f"✓ Plot saved: {out}")
+
+    print("\nThank you for using the SAC Portfolio Evaluation System!")
 
 
 if __name__ == "__main__":

@@ -105,7 +105,7 @@ class EnvironmentConfig:
 
     # Reward shaping
     reward_scale: float = 100.0
-    reward_clip_min: float = -1.0    # net_return clip BEFORE log1p
+    reward_clip_min: float = -0.999    # net_return clip BEFORE log1p
     reward_clip_max: float = 1.0
 
     # Terminal handling (portfolio tasks are usually time-truncated, not terminal)
@@ -130,7 +130,7 @@ class NetworkConfig:
     """Neural network architecture configuration."""
     hidden_size: int = 256
     num_layers: int = 2
-    activation: str = "relu"         # "relu" | "gelu"
+    activation: str = "relu"         
     layer_norm: bool = False
     dropout: float = 0.0
     weight_decay: float = 0.0
@@ -173,7 +173,7 @@ class SACConfig:
 @dataclass
 class TrainingConfig:
     """Training loop configuration."""
-    total_timesteps: int = 1_500_000
+    total_timesteps: int = 1_200_000
     log_interval_episodes: int = 10
     save_interval_episodes: int = 50
 
