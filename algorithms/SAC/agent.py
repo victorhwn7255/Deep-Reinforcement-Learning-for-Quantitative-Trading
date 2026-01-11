@@ -99,11 +99,17 @@ class Agent:
         # Entropy tuning
         self.auto_entropy_tuning = auto_entropy_tuning
         if auto_entropy_tuning:
-            # Target entropy is -dim(A) by default
             if target_entropy is None:
-                self.target_entropy = -n_action
+                # Dirichlet entropy is differential entropy (can be negative) and is NOT ~log(K).
+                # The maximum entropy over the simplex occurs at alpha = 1 (uniform Dirichlet).
+                # We set target slightly below the maximum (more negative) to avoid chasing an
+                # unattainable target and destabilizing alpha tuning.
+                with torch.no_grad():
+                    uniform_alpha = torch.ones(n_action, device=device)
+                    h_max = Dirichlet(uniform_alpha).entropy().item()
+                self.target_entropy = h_max - 0.5  # margin in nats; tune (e.g., 0.1 to 2.0)
             else:
-                self.target_entropy = target_entropy
+                self.target_entropy = float(target_entropy)
             
             # Log alpha for optimization (log for numerical stability)
             self.log_alpha = torch.tensor(np.log(alpha), dtype=torch.float32, 
@@ -195,7 +201,7 @@ class Agent:
         with torch.no_grad():
             # Use value target for computing Q targets
             target_v = self.value_target(next_states)
-            q_target = rewards + self.gamma * (1 - dones) * target_v
+            q_target = rewards + self.gamma * target_v
         
         # Current Q estimates
         q1_pred = self.q1(states, actions)

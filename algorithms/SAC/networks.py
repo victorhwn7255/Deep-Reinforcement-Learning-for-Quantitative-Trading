@@ -77,7 +77,7 @@ class PolicyNetwork(nn.Module):
         n_input: int,
         n_action: int,
         n_hidden: int = 256,
-        alpha_min: float = 0.1,
+        alpha_min: float = 0.6,
         alpha_max: float = 100.0,
         action_eps: float = 1e-8,
     ):

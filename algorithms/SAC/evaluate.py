@@ -1,4 +1,3 @@
-import yfinance as yf
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -11,6 +10,7 @@ import torch
 
 from environment import Env
 from agent import Agent
+from data_utils import load_market_data
 
 print("="*60)
 print("SAC PORTFOLIO EVALUATION SCRIPT")
@@ -82,17 +82,12 @@ print("LOADING MARKET DATA (one-time setup)")
 print("="*60)
 
 try:
-    print(f"Downloading data for {tickers}...")
-    df = yf.download(tickers, start=start, end=end, progress=False)
-    if df.empty:
-        raise ValueError("Downloaded data is empty.")
-    print(f"✓ Downloaded {len(df)} days of data")
+    df = load_market_data(tickers, start, end, auto_adjust=True, progress=False)
 except Exception as e:
     print(f"✗ Error downloading data: {e}")
+    print(f"  Tickers: {tickers}")
+    print(f"  Date range: {start} to {end}")
     exit(1)
-
-df = df['Close']
-df = df.dropna().copy()
 
 ####################
 ### VIX Features ###

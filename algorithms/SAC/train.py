@@ -1,4 +1,3 @@
-import yfinance as yf
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -10,6 +9,7 @@ import torch
 
 from environment import Env
 from agent import Agent
+from data_utils import load_market_data
 
 print("="*60)
 print("SAC PORTFOLIO TRAINING SCRIPT")
@@ -23,7 +23,7 @@ end = '2024-12-31'
 tickers = ['VNQ', 'SPY', 'TLT', 'GLD', 'BTC-USD']
 
 # SAC Hyperparameters
-total_timesteps = 1800000
+total_timesteps = 1500000
 learning_rate = 0.001
 gamma = 0.99
 tau = 0.005                    # Soft update coefficient
@@ -31,7 +31,7 @@ alpha = 0.2                    # Initial entropy coefficient
 auto_entropy_tuning = True     # Automatically tune alpha
 buffer_size = 1000000          # Replay buffer size
 batch_size = 256               # Batch size for updates
-learning_starts = 10000        # Steps before starting to learn
+learning_starts = 3900        # Steps before starting to learn
 update_frequency = 1           # How often to update networks
 n_hidden = 256                 # Hidden layer size
 
@@ -50,19 +50,12 @@ print("STEP 1: DOWNLOADING MARKET DATA")
 print("="*60)
 
 try:
-    print(f"Downloading data for {tickers}...")
-    df = yf.download(tickers, start=start, end=end, progress=False)
-    if df.empty:
-        raise ValueError("Downloaded data is empty. Check tickers and date range.")
-    print(f"✓ Downloaded {len(df)} days of data")
+    df = load_market_data(tickers, start, end, auto_adjust=True, progress=False)
 except Exception as e:
     print(f"✗ Error downloading data: {e}")
     print(f"  Tickers: {tickers}")
     print(f"  Date range: {start} to {end}")
     exit(1)
-
-df = df['Close']
-df = df.dropna().copy()
 
 ####################
 ### VIX Features ###
@@ -240,13 +233,27 @@ print("="*60)
 # Environment configuration
 include_position_in_state = True  # IMPORTANT: must match Agent n_input
 
-# Transaction cost configuration (train with non-zero costs to avoid unrealistic high turnover policies)
-# tc_rate is proportional cost per unit turnover (e.g., 0.001 = 10 bps per 100% turnover)
-tc_rate = 0.0005                 # 5 bps per unit turnover (tune to your venue/instruments)
-tc_fixed = 0.0                   # fixed cost charged whenever turnover > threshold
-turnover_threshold = 0.0         # ignore tiny rebalances if desired (e.g., 0.01 means <1% turnover is free)
+# -------------------------------
+# Transaction cost configuration
+# -------------------------------
+# Convention (aligned with environment.py):
+#   - turnover_use_half_factor=True  => turnover is ONE-WAY turnover = 0.5 * sum(|Δw|)
+#   - tc_rate is interpreted as BPS PER 1.0 ONE-WAY TURNOVER
+# Example:
+#   If you rebalance 10% from A -> B, one-way turnover is 0.10.
+#   tc_rate_bps=5 means cost = 5 bps * 0.10 = 0.5 bps return drag for that step.
+
+tc_rate_bps = 5.0                # 5 bps per 1.0 one-way turnover (tune to your venue/instruments)
+tc_rate = tc_rate_bps / 10000.0  # convert bps to decimal
+
+tc_fixed = 0.0                   # fixed cost charged whenever turnover > threshold (as return drag)
+turnover_threshold = 0.0         # ignore tiny rebalances if desired (e.g., 0.01 => <1% one-way turnover is free)
 turnover_include_cash = False    # exclude cash from turnover by default (simpler; avoids double-counting)
-turnover_use_half_factor = True  # common convention to avoid double-counting turnover
+turnover_use_half_factor = True  # compute ONE-WAY turnover (recommended with tc_rate in bps per one-way turnover)
+
+# Reward scaling (stability): reward = reward_scale * log1p(net_return)
+reward_scale = 100.0
+
 
 env = Env(
     df_train,
@@ -258,11 +265,15 @@ env = Env(
     turnover_threshold=turnover_threshold,
     turnover_include_cash=turnover_include_cash,
     turnover_use_half_factor=turnover_use_half_factor,
+    reward_scale=reward_scale,
 )
 
 print(f"✓ Environment state dimension (actual): {env.get_state_dim()}")
 print(f"✓ Environment action dimension (actual): {env.get_action_dim()}")
-print(f"✓ Training transaction costs: tc_rate={tc_rate} | tc_fixed={tc_fixed} | turnover_threshold={turnover_threshold}")
+print(
+    f"✓ Training transaction costs (one-way): tc_rate={tc_rate:.6f} ({tc_rate_bps:.1f} bps per 1.0 one-way turnover)"
+    f" | tc_fixed={tc_fixed} | turnover_threshold={turnover_threshold}"
+)
 
 
 ##############
