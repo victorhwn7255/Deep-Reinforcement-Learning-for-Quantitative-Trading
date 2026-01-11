@@ -39,10 +39,19 @@ n_hidden = 256
 model_path_best = "models/sac_portfolio_best.pth"
 model_path_final = "models/sac_portfolio_final.pth"
 
-# Device
-device = torch.device("cuda" if torch.cuda.is_available() else 
-                      "mps" if torch.backends.mps.is_available() else 
-                      "cpu")
+# Device selection (skip MPS due to Dirichlet incompatibility)
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print("✓ Using device: CUDA (NVIDIA GPU)")
+elif torch.backends.mps.is_available():
+    print("⚠ WARNING: MPS (Apple Silicon) detected but not supported for SAC evaluation")
+    print("  Reason: Dirichlet distribution requires CPU or CUDA")
+    print("  Falling back to CPU (this is expected)")
+    device = torch.device("cpu")
+    print("✓ Using device: CPU")
+else:
+    device = torch.device("cpu")
+    print("✓ Using device: CPU")
 
 ##########################
 ### Check Model Exists ###
@@ -206,9 +215,30 @@ print("\n" + "="*60)
 print("CREATING TEST ENVIRONMENT")
 print("="*60)
 
-env_test = Env(df_test, tickers, lag=5)
+# Environment configuration - MUST MATCH TRAINING!
+include_position_in_state = True  # Same as training
+tc_rate = 0.0005                 # Same as training: 5 bps per unit turnover
+tc_fixed = 0.0                   # Same as training
+turnover_threshold = 0.0         # Same as training
+turnover_include_cash = False    # Same as training
+turnover_use_half_factor = True  # Same as training
+
+env_test = Env(
+    df_test,
+    tickers,
+    lag=5,
+    tc_rate=tc_rate,
+    tc_fixed=tc_fixed,
+    turnover_threshold=turnover_threshold,
+    include_position_in_state=include_position_in_state,
+    turnover_include_cash=turnover_include_cash,
+    turnover_use_half_factor=turnover_use_half_factor,
+)
+
 print(f"✓ Test environment created")
-print(f"  State dimension: {env_test.states.shape[1] * env_test.lag}")
+print(f"  State dimension: {env_test.get_state_dim()}")
+print(f"  Action dimension: {env_test.get_action_dim()}")
+print(f"  Transaction costs: tc_rate={tc_rate} | tc_fixed={tc_fixed}")
 
 #############
 ### AGENT ###
@@ -218,8 +248,8 @@ print("INITIALIZING AGENT (one-time setup)")
 print("="*60)
 
 agent = Agent(
-    n_input=env_test.states.shape[1] * env_test.lag,
-    n_action=len(tickers) + 1,
+    n_input=env_test.get_state_dim(),
+    n_action=env_test.get_action_dim(),
     learning_rate=learning_rate,
     gamma=gamma,
     tau=tau,
@@ -365,7 +395,7 @@ while True:
         sac_actions = np.array(sac_actions)
         
         # Calculate metrics
-        sac_cumulative = np.cumprod(1 + sac_rewards)
+        sac_cumulative = np.cumprod(np.exp(sac_rewards))
         sac_total_return = sac_cumulative[-1] - 1
         sac_sharpe = np.mean(sac_rewards) / (np.std(sac_rewards) + 1e-8) * np.sqrt(252)
         
@@ -409,7 +439,7 @@ while True:
         sac_actions = np.array(sac_actions)
         
         # Calculate metrics
-        sac_cumulative = np.cumprod(1 + sac_rewards)
+        sac_cumulative = np.cumprod(np.exp(sac_rewards))
         sac_total_return = sac_cumulative[-1] - 1
         sac_sharpe = np.mean(sac_rewards) / (np.std(sac_rewards) + 1e-8) * np.sqrt(252)
         
@@ -466,7 +496,7 @@ while True:
             run_actions = np.array(run_actions)
             
             # Calculate metrics for this run
-            run_cumulative = np.cumprod(1 + run_rewards)
+            run_cumulative = np.cumprod(np.exp(run_rewards))
             run_return = run_cumulative[-1] - 1
             run_sharpe = np.mean(run_rewards) / (np.std(run_rewards) + 1e-8) * np.sqrt(252)
             run_volatility = np.std(run_rewards) * np.sqrt(252)
@@ -507,7 +537,7 @@ while True:
         sac_actions = all_actions_list[median_idx]
         
         # Recalculate for median run (for visualization)
-        sac_cumulative = np.cumprod(1 + sac_rewards)
+        sac_cumulative = np.cumprod(np.exp(sac_rewards))
         sac_total_return = sac_cumulative[-1] - 1
         sac_sharpe = np.mean(sac_rewards) / (np.std(sac_rewards) + 1e-8) * np.sqrt(252)
         sac_running_max = np.maximum.accumulate(sac_cumulative)
@@ -532,7 +562,7 @@ while True:
         benchmark_rewards.append(reward)
     
     benchmark_rewards = np.array(benchmark_rewards)
-    benchmark_cumulative = np.cumprod(1 + benchmark_rewards)
+    benchmark_cumulative = np.cumprod(np.exp(benchmark_rewards))
     benchmark_total_return = benchmark_cumulative[-1] - 1
     benchmark_sharpe = np.mean(benchmark_rewards) / (np.std(benchmark_rewards) + 1e-8) * np.sqrt(252)
     

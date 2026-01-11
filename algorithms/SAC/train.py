@@ -237,16 +237,48 @@ print("\n" + "="*60)
 print("STEP 7: CREATING TRAINING ENVIRONMENT")
 print("="*60)
 
-env = Env(df_train, tickers, lag=5)
-print(f"✓ Environment state dimension: {env.states.shape[1] * env.lag}")
+# Environment configuration
+include_position_in_state = True  # IMPORTANT: must match Agent n_input
+
+# Transaction cost configuration (train with non-zero costs to avoid unrealistic high turnover policies)
+# tc_rate is proportional cost per unit turnover (e.g., 0.001 = 10 bps per 100% turnover)
+tc_rate = 0.0005                 # 5 bps per unit turnover (tune to your venue/instruments)
+tc_fixed = 0.0                   # fixed cost charged whenever turnover > threshold
+turnover_threshold = 0.0         # ignore tiny rebalances if desired (e.g., 0.01 means <1% turnover is free)
+turnover_include_cash = False    # exclude cash from turnover by default (simpler; avoids double-counting)
+turnover_use_half_factor = True  # common convention to avoid double-counting turnover
+
+env = Env(
+    df_train,
+    tickers,
+    lag=5,
+    include_position_in_state=include_position_in_state,
+    tc_rate=tc_rate,
+    tc_fixed=tc_fixed,
+    turnover_threshold=turnover_threshold,
+    turnover_include_cash=turnover_include_cash,
+    turnover_use_half_factor=turnover_use_half_factor,
+)
+
+print(f"✓ Environment state dimension (actual): {env.get_state_dim()}")
+print(f"✓ Environment action dimension (actual): {env.get_action_dim()}")
+print(f"✓ Training transaction costs: tc_rate={tc_rate} | tc_fixed={tc_fixed} | turnover_threshold={turnover_threshold}")
+
 
 ##############
 ### Device ###
 ##############
-device = torch.device("cuda" if torch.cuda.is_available() else 
-                      "mps" if torch.backends.mps.is_available() else 
-                      "cpu")
-print(f"✓ Using device: {device}")
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print("✓ Using device: CUDA (NVIDIA GPU)")
+elif torch.backends.mps.is_available():
+    print("⚠ WARNING: Apple Silicon (MPS) detected.")
+    print("  This train.py is intended for CUDA training; using CPU to avoid MPS-specific issues.")
+    device = torch.device("cpu")
+    print("✓ Using device: CPU")
+else:
+    device = torch.device("cpu")
+    print("✓ Using device: CPU")
 
 #############
 ### AGENT ###
@@ -256,8 +288,8 @@ print("STEP 8: INITIALIZING SAC AGENT")
 print("="*60)
 
 agent = Agent(
-    n_input=env.states.shape[1] * env.lag,
-    n_action=len(tickers) + 1,
+    n_input=env.get_state_dim(),
+    n_action=env.get_action_dim(),
     learning_rate=learning_rate,
     gamma=gamma,
     tau=tau,
