@@ -153,6 +153,7 @@ backtest_results/
 videos/
 *.pt
 plots/
+results/
 
 # macOS
 .DS_Store
