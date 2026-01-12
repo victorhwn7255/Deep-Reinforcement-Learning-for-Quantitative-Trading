@@ -16,12 +16,16 @@ from replay_buffer import ReplayBuffer
 
 
 class Agent:
-    """Soft Actor-Critic (SAC v2) agent for portfolio management with Dirichlet policy.
+    """Soft Actor-Critic (SAC v2) agent with Dirichlet policy.
 
     SAC v2:
       - Twin critics Q1, Q2 with target critics Q1_target, Q2_target
       - No Value network
-      - Critic target uses: min(Q_target(s', a')) - alpha * log pi(a'|s')
+      - Target uses: min(Q_tgt(s',a')) - alpha * log pi(a'|s')
+
+    Production fix:
+      - Temperature tuning uses Dirichlet entropy directly (policy.entropy),
+        not log_prob scale heuristics.
     """
 
     def __init__(self, state_dim: int, action_dim: int, cfg, device: torch.device):
@@ -31,9 +35,6 @@ class Agent:
         self.state_dim = int(state_dim)
         self.action_dim = int(action_dim)
 
-        # -------------------------
-        # Hyperparameters
-        # -------------------------
         sac = cfg.sac
         self.gamma = float(sac.gamma)
         self.tau = float(sac.tau)
@@ -44,18 +45,13 @@ class Agent:
         self.updates_per_step = int(getattr(sac, "updates_per_step", 1))
         self.grad_clip = float(getattr(sac, "gradient_clip_norm", 0.0))
 
-        # Done handling
         self.treat_done_as_truncation = bool(getattr(cfg.env, "treat_done_as_truncation", True))
 
-        # -------------------------
         # Temperature / entropy
-        # -------------------------
         self.auto_entropy_tuning = bool(sac.auto_entropy_tuning)
-
-        # We'll keep a numeric alpha for logging/use; if auto-tuning, it's derived from log_alpha.
         self.alpha = float(sac.init_alpha)
 
-        # Target entropy heuristic (Dirichlet-specific heuristic from cfg)
+        # Dirichlet-native target entropy (units consistent with policy.entropy())
         self.target_entropy = float(cfg.compute_target_entropy(self.action_dim))
 
         if self.auto_entropy_tuning:
@@ -66,11 +62,8 @@ class Agent:
             self.log_alpha = None
             self.alpha_optimizer = None
 
-        # -------------------------
-        # Networks (SAC v2)
-        # -------------------------
+        # Networks
         net_cfg = cfg.network
-
         self.policy = PolicyNetwork(self.state_dim, self.action_dim, net_cfg).to(self.device)
         self.q1 = SoftQNetwork(self.state_dim, self.action_dim, net_cfg).to(self.device)
         self.q2 = SoftQNetwork(self.state_dim, self.action_dim, net_cfg).to(self.device)
@@ -83,9 +76,7 @@ class Agent:
         for p in self.q2_target.parameters():
             p.requires_grad = False
 
-        # -------------------------
         # Optimizers
-        # -------------------------
         wd = float(getattr(net_cfg, "weight_decay", 0.0))
         self.policy_optimizer = optim.Adam(self.policy.parameters(), lr=float(sac.actor_lr), weight_decay=wd)
         self.q1_optimizer = optim.Adam(self.q1.parameters(), lr=float(sac.critic_lr), weight_decay=wd)
@@ -105,12 +96,7 @@ class Agent:
     # Utilities
     # -------------------------------------------------------------------------
     def select_action(self, state: np.ndarray, evaluate: bool = False) -> np.ndarray:
-        """Return portfolio weights action."""
-        if isinstance(state, np.ndarray):
-            s = state.flatten().astype(np.float32)
-        else:
-            s = np.asarray(state, dtype=np.float32).reshape(-1)
-
+        s = np.asarray(state, dtype=np.float32).reshape(-1)
         state_tensor = torch.as_tensor(s, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         with torch.no_grad():
@@ -122,7 +108,6 @@ class Agent:
         return action.squeeze(0).cpu().numpy()
 
     def _soft_update(self, source: nn.Module, target: nn.Module) -> None:
-        """Polyak averaging update: target = tau*source + (1-tau)*target."""
         tau = float(self.tau)
         with torch.no_grad():
             for p, tp in zip(source.parameters(), target.parameters()):
@@ -134,13 +119,12 @@ class Agent:
             torch.nn.utils.clip_grad_norm_(module.parameters(), self.grad_clip)
 
     def _current_alpha_tensor(self) -> torch.Tensor:
-        """Return alpha as a torch scalar tensor on device."""
         if self.auto_entropy_tuning and self.log_alpha is not None:
             return self.log_alpha.exp()
         return torch.tensor(self.alpha, device=self.device, dtype=torch.float32)
 
     # -------------------------------------------------------------------------
-    # Learning update (SAC v2)
+    # SAC v2 update
     # -------------------------------------------------------------------------
     def update(self) -> Optional[Dict[str, float]]:
         if not self.replay_buffer.is_ready(self.batch_size):
@@ -153,9 +137,9 @@ class Agent:
         next_states = batch["next_states"].to(self.device)
         dones = batch.get("dones", None)
 
-        # Ensure shapes [B, 1]
         if rewards.dim() == 1:
             rewards = rewards.unsqueeze(1)
+
         if dones is None:
             dones = torch.zeros_like(rewards)
         else:
@@ -163,24 +147,20 @@ class Agent:
             if dones.dim() == 1:
                 dones = dones.unsqueeze(1)
 
-        alpha_t = self._current_alpha_tensor().detach()  # used for targets & losses (detach unless tuning loss)
+        alpha_detached = self._current_alpha_tensor().detach()
 
         # -------------------------
-        # Critic target (SAC v2)
+        # Critic target
         # y = r + gamma * not_done * (min(Q_tgt(s',a')) - alpha * logp(a'|s'))
         # -------------------------
         with torch.no_grad():
-            next_actions, next_logp = self.policy.sample(next_states)  # next_logp: [B,1]
+            next_actions, next_logp = self.policy.sample(next_states)
             q1_t = self.q1_target(next_states, next_actions)
             q2_t = self.q2_target(next_states, next_actions)
             min_q_t = torch.min(q1_t, q2_t)
 
-            if self.treat_done_as_truncation:
-                not_done = torch.ones_like(dones)
-            else:
-                not_done = 1.0 - dones
-
-            target_q = rewards + self.gamma * not_done * (min_q_t - alpha_t * next_logp)
+            not_done = torch.ones_like(dones) if self.treat_done_as_truncation else (1.0 - dones)
+            target_q = rewards + self.gamma * not_done * (min_q_t - alpha_detached * next_logp)
 
         # -------------------------
         # Update critics
@@ -204,13 +184,12 @@ class Agent:
         # Update policy
         # L_pi = E[ alpha*logp(a|s) - min(Q1,Q2)(s,a) ]
         # -------------------------
-        new_actions, logp = self.policy.sample(states)  # logp: [B,1]
+        new_actions, logp = self.policy.sample(states)
         q1_new = self.q1(states, new_actions)
         q2_new = self.q2(states, new_actions)
         min_q_new = torch.min(q1_new, q2_new)
 
-        # Use alpha (detached) for actor loss; alpha gradient handled in alpha_loss
-        policy_loss = (alpha_t * logp - min_q_new).mean()
+        policy_loss = (alpha_detached * logp - min_q_new).mean()
 
         self.policy_optimizer.zero_grad(set_to_none=True)
         policy_loss.backward()
@@ -218,20 +197,27 @@ class Agent:
         self.policy_optimizer.step()
 
         # -------------------------
-        # Temperature / alpha update (optional)
-        # Standard SAC form:
-        # L_alpha = -E[ log_alpha * (logp + target_entropy) ]
+        # Dirichlet entropy-based alpha update (production fix)
+        # Goal: match E[entropy] to target_entropy (same units).
         # -------------------------
         alpha_loss = None
+        avg_entropy = float("nan")
+
         if self.auto_entropy_tuning and self.log_alpha is not None and self.alpha_optimizer is not None:
-            # Detach logp so alpha update doesn't backprop into policy
-            alpha_loss = -(self.log_alpha * (logp.detach() + self.target_entropy)).mean()
+            with torch.no_grad():
+                ent = self.policy.entropy(states)  # [B,1]
+                avg_entropy = float(ent.mean().item())
+
+            alpha = self.log_alpha.exp()
+            alpha_loss = (alpha * (ent - self.target_entropy)).mean()
 
             self.alpha_optimizer.zero_grad(set_to_none=True)
             alpha_loss.backward()
             self.alpha_optimizer.step()
-
             self.alpha = float(self.log_alpha.exp().item())
+        else:
+            with torch.no_grad():
+                avg_entropy = float(self.policy.entropy(states).mean().item())
 
         # -------------------------
         # Soft update target critics
@@ -245,6 +231,7 @@ class Agent:
             "policy_loss": float(policy_loss.item()),
             "alpha": float(self.alpha),
             "avg_logp": float(logp.mean().item()),
+            "avg_entropy": float(avg_entropy),
         }
         if alpha_loss is not None:
             out["alpha_loss"] = float(alpha_loss.item())
@@ -254,7 +241,6 @@ class Agent:
     # Training loop
     # -------------------------------------------------------------------------
     def learn(self, env, total_timesteps: Optional[int] = None):
-        """Train on env for total_timesteps. Episodes end on dataset truncation."""
         if total_timesteps is None:
             total_timesteps = int(self.cfg.training.total_timesteps)
 
@@ -267,13 +253,11 @@ class Agent:
         obs = env.reset()
         episode_return = 0.0
         episode_count = 0
-
         start_time = time.time()
 
         for step in range(int(total_timesteps)):
             self.global_step = step
 
-            # action selection
             if step < self.learning_starts:
                 action = np.random.dirichlet(np.ones(self.action_dim)).astype(np.float32)
             else:
@@ -282,17 +266,14 @@ class Agent:
             next_obs, reward, done = env.step(action)
             episode_return += float(reward)
 
-            # store transition
             self.replay_buffer.add(obs, action, reward, next_obs, float(done))
 
-            # updates
             if step >= self.learning_starts and step % self.update_frequency == 0:
                 for _ in range(max(1, self.updates_per_step)):
                     loss_dict = self.update()
                     if loss_dict is not None:
                         losses.append(loss_dict)
 
-            # episode boundary: dataset end
             if done:
                 episode_count += 1
                 episode_returns.append(float(episode_return))
@@ -305,7 +286,6 @@ class Agent:
                         f"elapsed={elapsed/60:.1f}m"
                     )
 
-                # best model tracking (avg over last 10 episodes)
                 if len(episode_returns) >= 10:
                     avg_return = float(np.mean(episode_returns[-10:]))
                     if avg_return > best_avg_return:
@@ -316,17 +296,14 @@ class Agent:
                             "avg_return": avg_return,
                             "all_returns": episode_returns.copy(),
                         })
-                        # save best immediately
                         os.makedirs(self.cfg.training.model_dir, exist_ok=True)
                         torch.save(best_model_state, self.cfg.training.model_path_best)
 
-                # periodic checkpoint save
                 if (episode_count % int(self.cfg.training.save_interval_episodes)) == 0:
                     os.makedirs(self.cfg.training.model_dir, exist_ok=True)
                     ckpt = self.export_state(extra={"episode": episode_count, "global_step": step})
                     torch.save(ckpt, self.cfg.training.model_path_final.replace(".pth", f"_ep{episode_count}.pth"))
 
-                # reset for next episode
                 obs = env.reset()
                 episode_return = 0.0
             else:
@@ -335,10 +312,9 @@ class Agent:
         return episode_returns, losses, best_model_state
 
     # -------------------------------------------------------------------------
-    # Checkpointing (SAC v2)
+    # Checkpointing
     # -------------------------------------------------------------------------
     def export_state(self, extra: Optional[Dict[str, object]] = None) -> Dict[str, object]:
-        # Save online networks. Targets can be reconstructed at load.
         out: Dict[str, object] = {
             "sac_version": "v2",
             "policy_state_dict": {k: v.detach().cpu() for k, v in self.policy.state_dict().items()},
@@ -350,7 +326,6 @@ class Agent:
         }
         if self.auto_entropy_tuning and self.log_alpha is not None:
             out["log_alpha"] = self.log_alpha.detach().cpu()
-
         if extra:
             out.update(extra)
         return out
@@ -363,22 +338,19 @@ class Agent:
         loc = map_location if map_location is not None else str(self.device)
         ckpt = torch.load(path, map_location=loc)
 
-        # Load online nets
         self.policy.load_state_dict(ckpt["policy_state_dict"])
         self.q1.load_state_dict(ckpt["q1_state_dict"])
         self.q2.load_state_dict(ckpt["q2_state_dict"])
 
-        # Rebuild targets from online nets for safety
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
 
-        # Alpha restore
         if ckpt.get("auto_entropy_tuning", False) and self.auto_entropy_tuning:
             if "log_alpha" in ckpt and self.log_alpha is not None:
                 self.log_alpha.data.copy_(ckpt["log_alpha"].to(self.device))
                 self.alpha = float(self.log_alpha.exp().item())
             else:
-                # fallback to alpha scalar
                 self.alpha = float(ckpt.get("alpha", self.alpha))
         else:
             self.alpha = float(ckpt.get("alpha", self.alpha))
+

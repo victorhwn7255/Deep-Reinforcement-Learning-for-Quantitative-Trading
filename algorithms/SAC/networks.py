@@ -43,17 +43,11 @@ def build_mlp(
     layer_norm: bool = False,
     dropout: float = 0.0,
 ) -> nn.Sequential:
-    """Generic MLP builder.
-
-    num_layers counts total linear layers including the output layer.
-    - num_layers=1: Linear(in_dim -> out_dim)
-    - num_layers>=2: (Linear+Act+...)* + Linear(out_dim)
-    """
+    """Generic MLP builder. num_layers counts linear layers including output."""
     in_dim = int(in_dim)
     out_dim = int(out_dim)
     hidden_size = int(hidden_size)
     num_layers = int(num_layers)
-
     if num_layers < 1:
         raise ValueError("num_layers must be >= 1")
 
@@ -65,7 +59,7 @@ def build_mlp(
         return nn.Sequential(*layers)
 
     # Hidden layers
-    dims = [in_dim] + [hidden_size] * (num_layers - 1)  # last hidden feeds to output separately
+    dims = [in_dim] + [hidden_size] * (num_layers - 1)
     for i in range(num_layers - 1):
         layers.append(nn.Linear(dims[i], dims[i + 1]))
         if layer_norm:
@@ -80,7 +74,7 @@ def build_mlp(
 
 
 # =============================================================================
-# Critic Networks (SAC v2 uses twin Q networks + target copies)
+# Critic Network
 # =============================================================================
 
 class SoftQNetwork(nn.Module):
@@ -103,63 +97,28 @@ class SoftQNetwork(nn.Module):
         self.apply(_xavier_init)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        # Ensure [B, D]
         if state.dim() == 1:
             state = state.unsqueeze(0)
         if action.dim() == 1:
             action = action.unsqueeze(0)
-
         x = torch.cat([state, action], dim=-1)
         q = self.q_net(x)
-        # Always [B, 1]
         if q.dim() == 1:
             q = q.unsqueeze(1)
         return q
 
 
 # =============================================================================
-# Value Network (compatibility shim; SAC v2 does NOT need this)
-# =============================================================================
-
-class ValueNetwork(nn.Module):
-    """DEPRECATED for SAC v2.
-
-    Kept temporarily so older imports don't break while we migrate step-by-step.
-    You will remove usage from agent.py in the next migration step.
-    """
-
-    def __init__(self, state_dim: int, net_cfg):
-        super().__init__()
-        self.state_dim = int(state_dim)
-
-        self.v_net = build_mlp(
-            in_dim=self.state_dim,
-            out_dim=1,
-            hidden_size=int(net_cfg.hidden_size),
-            num_layers=max(1, int(net_cfg.num_layers)),
-            activation=str(net_cfg.activation),
-            layer_norm=bool(net_cfg.layer_norm),
-            dropout=float(net_cfg.dropout),
-        )
-        self.apply(_xavier_init)
-
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
-        v = self.v_net(state)
-        if v.dim() == 1:
-            v = v.unsqueeze(1)
-        return v
-
-
-# =============================================================================
-# Policy Network (Dirichlet over simplex)
+# Policy Network (Dirichlet)
 # =============================================================================
 
 class PolicyNetwork(nn.Module):
-    """Dirichlet policy π(a|s) over the simplex (long-only weights).
+    """Dirichlet policy π(a|s) over simplex (long-only weights incl cash).
 
-    Outputs Dirichlet concentration parameters alpha > 0.
+    Key production fix:
+      - DO NOT clamp/renormalize sampled actions inside sample() before log_prob.
+        Dirichlet samples are already on the simplex.
+      - Provide entropy(state) for Dirichlet-native temperature tuning.
     """
 
     def __init__(self, state_dim: int, action_dim: int, net_cfg):
@@ -167,7 +126,6 @@ class PolicyNetwork(nn.Module):
         self.state_dim = int(state_dim)
         self.action_dim = int(action_dim)
 
-        self.action_eps = float(net_cfg.action_eps)
         self.alpha_min = float(net_cfg.alpha_min)
         self.alpha_max = float(net_cfg.alpha_max)
 
@@ -181,60 +139,68 @@ class PolicyNetwork(nn.Module):
             dropout=float(net_cfg.dropout),
         )
         self.alpha_head = nn.Linear(int(net_cfg.hidden_size), self.action_dim)
-
         self.apply(_xavier_init)
 
-    @staticmethod
-    def _safe_simplex(action: torch.Tensor, eps: float) -> torch.Tensor:
-        """Clamp to (eps, 1) and renormalize to sum=1."""
-        a = torch.clamp(action, min=eps)
-        a = a / (a.sum(dim=-1, keepdim=True) + 1e-12)
-        return a
-
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        """Return alpha parameters, shape [B, action_dim]."""
+        """Return concentration alpha > 0, shape [B, action_dim]."""
         if state.dim() == 1:
             state = state.unsqueeze(0)
-
         h = self.feature_net(state)
         raw = self.alpha_head(h)
-
-        # Softplus to ensure positivity + floor, then clamp for stability
         alpha = F.softplus(raw) + self.alpha_min
         alpha = torch.clamp(alpha, min=self.alpha_min, max=self.alpha_max)
         return alpha
 
     def sample(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample action with reparameterization; returns:
-        - action: [B, action_dim]
-        - log_prob: [B, 1]
-        """
-        alpha = self.forward(state)
-
-        # Dirichlet gradients can be problematic on some backends; compute log_prob on CPU for MPS safety
-        dist = Dirichlet(alpha)
-        action = dist.rsample()  # [B, action_dim], differentiable
-        action = self._safe_simplex(action, self.action_eps)
-
-        log_prob = dist.log_prob(action)  # [B]
-        log_prob = log_prob.unsqueeze(1)  # [B,1]
-        return action, log_prob
-
-    def log_prob_and_entropy(self, state: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute log_prob and entropy for given (state, action).
+        """Reparameterized sample + log_prob.
         Returns:
-        - log_prob: [B, 1]
-        - entropy:  [B, 1]
+          action: [B, action_dim]
+          log_prob: [B, 1]
         """
-        alpha = self.forward(state)
-        dist = Dirichlet(alpha)
-        action = self._safe_simplex(action, self.action_eps)
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
 
-        log_prob = dist.log_prob(action).unsqueeze(1)
-        entropy = dist.entropy().unsqueeze(1)
-        return log_prob, entropy
+        out_device = state.device
+        alpha = self.forward(state)
+
+        # MPS safety: Dirichlet rsample/log_prob gradients are often problematic
+        if out_device.type == "mps" and torch.is_grad_enabled():
+            raise RuntimeError(
+                "Dirichlet rsample/log_prob gradients may be unsupported on MPS. Use CPU or CUDA."
+            )
+
+        # For eval-only on MPS, compute on CPU and move back
+        if out_device.type == "mps":
+            alpha_cpu = alpha.detach().cpu()
+            dist = Dirichlet(alpha_cpu)
+            action_cpu = dist.rsample()
+            logp_cpu = dist.log_prob(action_cpu)
+            return action_cpu.to(out_device), logp_cpu.unsqueeze(1).to(out_device)
+
+        dist = Dirichlet(alpha)
+        action = dist.rsample()                # already on simplex
+        logp = dist.log_prob(action)           # exact log_prob of sampled action
+        return action, logp.unsqueeze(1)
+
+    def entropy(self, state: torch.Tensor) -> torch.Tensor:
+        """Return policy entropy H(Dir(alpha(s))) as [B,1]."""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        alpha = self.forward(state)
+
+        out_device = state.device
+        if out_device.type == "mps":
+            alpha_cpu = alpha.detach().cpu()
+            dist = Dirichlet(alpha_cpu)
+            ent = dist.entropy()
+            return ent.unsqueeze(1).to(out_device)
+
+        dist = Dirichlet(alpha)
+        return dist.entropy().unsqueeze(1)
 
     def get_deterministic_action(self, state: torch.Tensor) -> torch.Tensor:
-        """A deterministic proxy action: mean of Dirichlet = alpha / alpha0."""
+        """Deterministic proxy = mean of Dirichlet = alpha / alpha0."""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
         alpha = self.forward(state)
         return alpha / (alpha.sum(dim=-1, keepdim=True) + 1e-12)

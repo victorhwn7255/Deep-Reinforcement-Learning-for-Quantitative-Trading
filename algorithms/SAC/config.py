@@ -140,7 +140,6 @@ class NetworkConfig:
     alpha_max: float = 100.0
     action_eps: float = 1e-8
 
-
 @dataclass
 class SACConfig:
     """SAC algorithm hyperparameters."""
@@ -150,14 +149,21 @@ class SACConfig:
     # Optimizers
     actor_lr: float = 1e-3
     critic_lr: float = 1e-3
-    value_lr: float = 1e-3
     alpha_lr: float = 1e-3
 
     # Entropy / temperature
     init_alpha: float = 0.2
     auto_entropy_tuning: bool = True
+
+    # If set, overrides auto target entropy
     target_entropy: Optional[float] = None
-    target_entropy_margin: float = 0.5  # proxy nats below max entropy
+
+    # Dirichlet-native target entropy:
+    # We define target_entropy = H(Dirichlet([c]*K)) - margin
+    dirichlet_entropy_concentration: float = 1.0
+
+    # subtract a small margin to encourage slightly less randomness (0.0 is fine too)
+    target_entropy_margin: float = 0.0
 
     # Replay / updates
     buffer_size: int = 1_000_000
@@ -167,8 +173,7 @@ class SACConfig:
     updates_per_step: int = 1
 
     # Stability
-    gradient_clip_norm: float = 0.0  # 0 disables clipping
-
+    gradient_clip_norm: float = 0.0
 
 @dataclass
 class TrainingConfig:
@@ -229,17 +234,23 @@ class Config:
         return torch.device("cpu")
 
     def compute_target_entropy(self, n_action: int) -> float:
-        """Heuristic target entropy for Dirichlet policies.
+        """Dirichlet-native target entropy (in the same units as Dirichlet.entropy()).
 
-        We use a proxy of log(n_action) (uniform categorical entropy) and subtract a margin.
-        This keeps target_entropy in a reasonable positive range while log_probs are negative.
+        If user provides sac.target_entropy, use it.
+        Otherwise, set target to entropy of symmetric Dirichlet([c]*K) minus a margin.
         """
         if self.sac.target_entropy is not None:
             return float(self.sac.target_entropy)
 
-        max_entropy_proxy = float(np.log(max(2, int(n_action))))
-        target = max_entropy_proxy - float(self.sac.target_entropy_margin)
-        return float(target)
+        K = int(max(2, n_action))
+        c = float(getattr(self.sac, "dirichlet_entropy_concentration", 1.0))
+        margin = float(getattr(self.sac, "target_entropy_margin", 0.0))
+
+        from torch.distributions import Dirichlet
+        alpha = torch.full((K,), c, dtype=torch.float32)
+        H = float(Dirichlet(alpha).entropy().item())
+        return float(H - margin)
+
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -363,7 +374,9 @@ class Config:
         if self.sac.target_entropy is not None:
             print(f"  target_entropy: {self.sac.target_entropy}")
         else:
-            print(f"  target_entropy: (auto via proxy; margin={self.sac.target_entropy_margin})")
+            c = float(getattr(self.sac, "dirichlet_entropy_concentration", 1.0))
+            m = float(getattr(self.sac, "target_entropy_margin", 0.0))
+            print(f"  target_entropy: (auto Dirichlet; concentration={c}, margin={m})")
 
         print("\nTRAINING:")
         print(f"  total_timesteps: {self.training.total_timesteps:,}")
