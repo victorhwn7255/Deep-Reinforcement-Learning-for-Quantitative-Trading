@@ -10,21 +10,11 @@ class Env:
     """Portfolio management environment with close-to-close mechanics.
 
     Action: target weights over (n_assets + cash) that sum to 1 (simplex).
+            => action_dim = n_assets + 1
     Reward: reward_scale * log1p(net_return) where net_return includes transaction costs.
     """
 
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        tickers: List[str],
-        cfg,
-    ):
-        """
-        Args:
-            df: Feature dataframe containing price columns for each ticker and all required features.
-            tickers: List of tradable tickers (must exist as columns in df).
-            cfg: Config object (expects cfg.env and cfg.features).
-        """
+    def __init__(self, df: pd.DataFrame, tickers: List[str], cfg):
         self.cfg = cfg
         self.tickers = list(tickers)
         self.n_assets = len(self.tickers)
@@ -42,8 +32,6 @@ class Env:
         self.reward_scale = float(cfg.env.reward_scale)
         self.reward_clip_min = float(cfg.env.reward_clip_min)
         self.reward_clip_max = float(cfg.env.reward_clip_max)
-
-        self.treat_done_as_truncation = bool(getattr(cfg.env, "treat_done_as_truncation", True))
 
         if self.lag <= 0:
             raise ValueError("lag must be a positive integer")
@@ -70,6 +58,14 @@ class Env:
 
         cleaned = cleaned.dropna(subset=self.tickers + self.columns).copy()
 
+        # IMPORTANT safety: need at least `lag` rows to form first observation window
+        if len(cleaned) < self.lag + 1:
+            raise ValueError(
+                f"Not enough rows after dropna to run env. "
+                f"Need at least lag+1={self.lag + 1} rows, got {len(cleaned)}. "
+                f"Consider lowering lag or improving feature NaN handling."
+            )
+
         self.states = cleaned[self.columns].to_numpy(dtype=np.float32)
         self.prices = cleaned[self.tickers].to_numpy(dtype=np.float32)
 
@@ -92,6 +88,7 @@ class Env:
         self.pos = self.lag - 1
         self.current_weights = np.zeros(self.n_assets + 1, dtype=np.float32)
         self.current_weights[-1] = 1.0
+
         self.last_turnover = 0.0
         self.last_turnover_total = 0.0
         self.last_tc_cost = 0.0
@@ -101,12 +98,14 @@ class Env:
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool]:
         action = np.asarray(action, dtype=np.float32).reshape(-1)
+
+        # Action includes cash => length = n_assets + 1
         if action.shape[0] != (self.n_assets + 1):
             raise ValueError(f"Action shape mismatch: expected {self.n_assets + 1}, got {action.shape[0]}")
         if not np.all(np.isfinite(action)):
             raise ValueError("Invalid action: contains NaN/inf")
 
-        # Project to long-only simplex
+        # Project to simplex (long-only)
         w_tgt = self._project_to_simplex(action)
 
         next_pos = self.pos + 1
@@ -134,29 +133,25 @@ class Env:
                 tc_cost += self.tc_fixed
             w_post_trade = w_tgt
 
-        # Gross portfolio return
         gross_return = float(np.dot(w_post_trade, asset_returns))
-
-        # Net return after costs as return drag
         net_return = gross_return - float(tc_cost)
 
         # Reward shaping
         net_return_clipped = float(np.clip(net_return, self.reward_clip_min, self.reward_clip_max))
         reward = float(self.reward_scale * np.log1p(net_return_clipped))
 
-        # Drift weights to t+1 after returns (realistic holdings)
+        # Drift weights to t+1 after returns
         w_drift = w_post_trade * (1.0 + asset_returns)
-        w_drift_sum = float(w_drift.sum())
-        if w_drift_sum <= 0.0 or not np.isfinite(w_drift_sum):
-            # catastrophic numerical issue; reset to cash
+        w_sum = float(w_drift.sum())
+        if w_sum <= 0.0 or not np.isfinite(w_sum):
             w_drift = np.zeros_like(w_drift, dtype=np.float32)
             w_drift[-1] = 1.0
         else:
-            w_drift = w_drift / w_drift_sum
+            w_drift = (w_drift / w_sum).astype(np.float32)
 
         # advance
         self.pos = next_pos
-        self.current_weights = w_drift.astype(np.float32)
+        self.current_weights = w_drift
 
         # stats
         self.last_turnover = float(turnover_oneway)
@@ -166,8 +161,7 @@ class Env:
         self.last_net_return = float(net_return)
 
         done = (self.pos + 1) >= len(self.states)
-        next_state = self._get_obs()
-        return next_state, reward, bool(done)
+        return self._get_obs(), reward, bool(done)
 
     # ---------------------------
     # Dimensions & monitoring
@@ -177,6 +171,7 @@ class Env:
         return base_dim + (self.n_assets + 1 if self.include_position_in_state else 0)
 
     def get_action_dim(self) -> int:
+        # MUST include cash
         return self.n_assets + 1
 
     def get_turnover_stats(self) -> Dict[str, object]:
@@ -194,7 +189,6 @@ class Env:
     # Internals
     # ---------------------------
     def _get_obs(self) -> np.ndarray:
-        """Flatten lagged features, optionally append current weights."""
         start = self.pos - self.lag + 1
         end = self.pos + 1
         window = self.states[start:end].reshape(-1).astype(np.float32)
@@ -206,7 +200,6 @@ class Env:
 
     @staticmethod
     def _project_to_simplex(w: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-        """Project arbitrary vector to long-only simplex."""
         w = np.clip(w, eps, np.inf)
         s = float(w.sum())
         if s <= 0.0 or not np.isfinite(s):
@@ -216,7 +209,6 @@ class Env:
         return (w / s).astype(np.float32)
 
     def _compute_turnover(self, w_prev: np.ndarray, w_tgt: np.ndarray) -> Tuple[float, float]:
-        """Compute one-way and total turnover."""
         if not self.turnover_include_cash:
             w_prev_use = w_prev[:-1]
             w_tgt_use = w_tgt[:-1]
@@ -226,8 +218,5 @@ class Env:
 
         delta = np.abs(w_tgt_use - w_prev_use)
         total = float(delta.sum())
-        if self.turnover_use_half_factor:
-            oneway = 0.5 * total
-        else:
-            oneway = total
+        oneway = 0.5 * total if self.turnover_use_half_factor else total
         return float(oneway), float(total)

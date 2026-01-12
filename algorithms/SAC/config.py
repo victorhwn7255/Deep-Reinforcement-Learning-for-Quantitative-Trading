@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 import json
@@ -251,9 +251,50 @@ class Config:
 
     @staticmethod
     def load_json(path: str) -> "Config":
+        """
+        Load config from JSON produced by Config.save_json().
+
+        This reconstructs nested dataclasses properly:
+        - experiment: ExperimentConfig
+        - data: DataConfig
+        - features: FeatureConfig
+        - env: EnvironmentConfig
+        - network: NetworkConfig
+        - sac: SACConfig
+        - training: TrainingConfig
+        - evaluation: EvaluationConfig
+
+        It also ignores unknown keys for forward/backward compatibility.
+        """
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        return Config(**raw)
+
+        if not isinstance(raw, dict):
+            raise ValueError(f"Config JSON must be an object/dict, got: {type(raw)}")
+
+        def build_section(cls, key: str):
+            section = raw.get(key, {})
+            if section is None:
+                section = {}
+            if not isinstance(section, dict):
+                # tolerate bad/old formats by falling back to defaults
+                section = {}
+
+            allowed = {fld.name for fld in fields(cls)}
+            kwargs = {k: v for k, v in section.items() if k in allowed}
+            return cls(**kwargs)
+
+        return Config(
+            experiment=build_section(ExperimentConfig, "experiment"),
+            data=build_section(DataConfig, "data"),
+            features=build_section(FeatureConfig, "features"),
+            env=build_section(EnvironmentConfig, "env"),
+            network=build_section(NetworkConfig, "network"),
+            sac=build_section(SACConfig, "sac"),
+            training=build_section(TrainingConfig, "training"),
+            evaluation=build_section(EvaluationConfig, "evaluation"),
+        )
+
 
     def set_global_seeds(self) -> None:
         """Seed Python, NumPy, and Torch."""
