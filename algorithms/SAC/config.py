@@ -104,7 +104,7 @@ class EnvironmentConfig:
     turnover_use_half_factor: bool = True
 
     # Reward shaping
-    reward_scale: float = 100.0
+    reward_scale: float = 10.0
     reward_clip_min: float = -0.999    # net_return clip BEFORE log1p
     reward_clip_max: float = 1.0
 
@@ -131,13 +131,13 @@ class NetworkConfig:
     hidden_size: int = 256
     num_layers: int = 2
     activation: str = "relu"         
-    layer_norm: bool = False
+    layer_norm: bool = True
     dropout: float = 0.0
     weight_decay: float = 0.0
 
     # Dirichlet policy safety
     alpha_min: float = 0.6
-    alpha_max: float = 100.0
+    alpha_max: float = 60.0
     action_eps: float = 1e-8
 
 @dataclass
@@ -147,9 +147,9 @@ class SACConfig:
     tau: float = 0.005
 
     # Optimizers
-    actor_lr: float = 1e-3
-    critic_lr: float = 1e-3
-    alpha_lr: float = 1e-3
+    actor_lr: float = 3e-4
+    critic_lr: float = 3e-4
+    alpha_lr: float = 3e-4
 
     # Entropy / temperature
     init_alpha: float = 0.2
@@ -163,22 +163,22 @@ class SACConfig:
     dirichlet_entropy_concentration: float = 1.0
 
     # subtract a small margin to encourage slightly less randomness (0.0 is fine too)
-    target_entropy_margin: float = 0.0
+    target_entropy_margin: float = 0.2
 
     # Replay / updates
-    buffer_size: int = 1_000_000
+    buffer_size: int = 420_000
     batch_size: int = 256
-    learning_starts: int = 3900
+    learning_starts: int = 5000
     update_frequency: int = 1
     updates_per_step: int = 1
 
     # Stability
-    gradient_clip_norm: float = 0.0
+    gradient_clip_norm: float = 1.0
 
 @dataclass
 class TrainingConfig:
     """Training loop configuration."""
-    total_timesteps: int = 1_200_000
+    total_timesteps: int = 900_000
     log_interval_episodes: int = 10
     save_interval_episodes: int = 50
 
