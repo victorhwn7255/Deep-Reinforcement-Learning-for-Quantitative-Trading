@@ -1,114 +1,298 @@
+from __future__ import annotations
+
+import os
+from typing import List, Sequence, Tuple
+
+import numpy as np
 import pandas as pd
-import yfinance as yf
+
+# NOTE:
+# - This module is intentionally "config-aware" but does NOT import Config directly
+#   to avoid circular imports. Callers should pass the relevant sub-config objects.
 
 
-def load_market_data(tickers, start, end, auto_adjust=True, progress=False):
+# =============================================================================
+# Market data
+# =============================================================================
+
+def load_market_data(tickers, start, end, auto_adjust=True, progress=False) -> pd.DataFrame:
     """Download and clean market data from yfinance.
 
-    Handles:
-    - MultiIndex extraction (yfinance >= 0.2.0)
-    - Index deduplication
-    - Ticker verification
-    - First valid index alignment
-    - NA cleaning
-
-    Args:
-        tickers: List of ticker symbols or single ticker string
-        start: Start date (YYYY-MM-DD)
-        end: End date (YYYY-MM-DD)
-        auto_adjust: Use adjusted prices (default True)
-        progress: Show download progress (default False)
-
     Returns:
-        DataFrame with Close prices, single-level columns (tickers as column names)
-
-    Raises:
-        ValueError: If data download fails or tickers missing
-
-    Example:
-        >>> tickers = ['SPY', 'TLT', 'GLD']
-        >>> df = load_market_data(tickers, '2020-01-01', '2024-01-01')
-        >>> print(df.columns.tolist())
-        ['SPY', 'TLT', 'GLD']
+        DataFrame indexed by date with columns = tickers (Close prices, adjusted if auto_adjust=True)
     """
     print(f"Downloading data for {tickers}...")
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception as e:
+        raise ImportError(
+            "yfinance is required for load_market_data (pip install yfinance). "
+            f"Import error: {e}"
+        )
+
     df_raw = yf.download(tickers, start=start, end=end, progress=progress, auto_adjust=auto_adjust)
 
     if df_raw.empty:
-        raise ValueError("Downloaded data is empty. Check tickers and date range.")
+        raise ValueError("Downloaded data is empty. Check tickers/date range/internet connectivity.")
 
-    print(f"✓ Downloaded {len(df_raw)} days of data")
-
-    # Extract Close prices robustly
+    # yfinance may return MultiIndex columns: ('Close', 'SPY') etc
     if isinstance(df_raw.columns, pd.MultiIndex):
-        print("  → Detected MultiIndex columns (yfinance >= 0.2.0)")
-        lv0 = df_raw.columns.get_level_values(0)
-        lv1 = df_raw.columns.get_level_values(1)
-
-        if "Close" in lv0:
-            df = df_raw.xs("Close", axis=1, level=0).copy()
-            print("  → Extracted Close prices from level 0")
-        elif "Close" in lv1:
-            df = df_raw.xs("Close", axis=1, level=1).copy()
-            print("  → Extracted Close prices from level 1")
+        # Prefer "Close" if present, else take the first level heuristically
+        if "Close" in df_raw.columns.get_level_values(0):
+            df = df_raw["Close"].copy()
         else:
-            raise ValueError("MultiIndex detected but cannot locate 'Close' level.")
+            # best effort: take the first column group
+            first_group = df_raw.columns.get_level_values(0)[0]
+            df = df_raw[first_group].copy()
     else:
-        print("  → Single-level columns (single ticker or old yfinance)")
+        # Single ticker may come as Series-like DF with OHLC columns; prefer 'Close'
         if "Close" in df_raw.columns:
-            # Single ticker case - yfinance returns simple columns
             df = df_raw[["Close"]].copy()
-            ticker_name = tickers[0] if isinstance(tickers, list) else tickers
-            df.columns = [ticker_name]
+            df.columns = [tickers] if isinstance(tickers, str) else [tickers[0]]
         else:
-            # Already has ticker names as columns
-            df = df_raw.copy()
+            raise ValueError("Unexpected yfinance schema: expected MultiIndex or a 'Close' column.")
 
-    # Basic index cleanup - remove duplicate timestamps
-    dup_count = df.index.duplicated().sum()
-    if dup_count > 0:
-        print(f"  → Removing {dup_count} duplicate timestamps")
+    # Ensure DatetimeIndex
+    df.index = pd.to_datetime(df.index)
     df = df[~df.index.duplicated(keep="first")].sort_index()
 
-    # Verify all expected tickers are present
-    tick_list = list(tickers) if isinstance(tickers, list) else [tickers]
-    missing = [t for t in tick_list if t not in df.columns]
+    # Ensure expected columns exist
+    tickers_list = [tickers] if isinstance(tickers, str) else list(tickers)
+    missing = [t for t in tickers_list if t not in df.columns]
     if missing:
-        available = df.columns.tolist()
-        raise ValueError(
-            f"Missing tickers in downloaded data: {missing}\n"
-            f"  Expected: {tick_list}\n"
-            f"  Available: {available}"
-        )
+        raise ValueError(f"Missing tickers in downloaded data: {missing}")
 
-    print(f"  ✓ Verified all {len(tick_list)} tickers present: {tick_list}")
-
-    # Finance-aware NA handling
-    # Different assets start trading at different times (e.g., BTC-USD much later than SPY)
-    # Align all tickers to the latest first valid index
-    first_valid = df.apply(pd.Series.first_valid_index).max()
-    if pd.isna(first_valid):
-        raise ValueError("No valid data found for any ticker")
-
-    days_trimmed = (first_valid - df.index.min()).days
-    if days_trimmed > 0:
-        print(f"  → Trimming {days_trimmed} days from start (aligning ticker histories)")
+    # Align start at first date where all tickers are non-NA
+    first_valid = df.dropna(how="any").index.min()
+    if first_valid is None:
+        raise ValueError("No date found where all tickers have valid prices.")
     df = df.loc[first_valid:].copy()
 
-    # Strict dropna - all tickers must have data on each day
-    # (ensures no missing values in environment)
-    df = df.dropna(how="any").copy()
+    # Forward-fill gaps conservatively, then drop remaining NAs
+    df = df.ffill().dropna(how="any")
 
-    print(f"  ✓ After cleaning: {len(df)} days remaining")
-    print(f"    Date range: {df.index.min().date()} to {df.index.max().date()}")
+    print(f"  ✓ Downloaded {len(df)} rows")
+    print(f"  ✓ Date range: {df.index.min().date()} to {df.index.max().date()}")
 
-    # Verify minimum data length
-    MIN_DAYS_REQUIRED = 100  # Minimum for any meaningful training/eval
+    MIN_DAYS_REQUIRED = 100
     if len(df) < MIN_DAYS_REQUIRED:
         raise ValueError(
             f"Insufficient data after cleaning: {len(df)} days "
-            f"(minimum required: {MIN_DAYS_REQUIRED}). "
-            f"Try adjusting start date or reviewing data quality."
+            f"(minimum required: {MIN_DAYS_REQUIRED})."
         )
 
     return df
+
+
+# =============================================================================
+# Macro data loading (VIX / VIX3M / Credit Spread)
+# =============================================================================
+
+def _read_macro_csv(
+    path: str,
+    date_col: str = "observation_date",
+    value_col_candidates: Sequence[str] = (),
+    rename_to: str = "value",
+) -> pd.DataFrame:
+    """Read a macro CSV with a date column and one value column (candidate list)."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Macro CSV not found: {path}")
+
+    df = pd.read_csv(path)
+    if date_col not in df.columns:
+        raise ValueError(f"Expected date column '{date_col}' in {path}. Columns: {list(df.columns)}")
+
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.set_index(date_col).sort_index()
+
+    value_col = None
+    for c in value_col_candidates:
+        if c in df.columns:
+            value_col = c
+            break
+    if value_col is None:
+        # fallback: if only one non-date column exists, use it
+        non_date_cols = [c for c in df.columns]
+        if len(non_date_cols) == 1:
+            value_col = non_date_cols[0]
+        else:
+            raise ValueError(
+                f"Could not infer value column in {path}. "
+                f"Tried: {list(value_col_candidates)}. Available: {list(df.columns)}"
+            )
+
+    out = df[[value_col]].rename(columns={value_col: rename_to})
+    return out
+
+
+def load_macro_data(data_cfg) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load VIX, VIX3M, and Credit Spread series using DataConfig candidate columns."""
+    vix = _read_macro_csv(
+        data_cfg.vix_path,
+        value_col_candidates=getattr(data_cfg, "vix_col_candidates", ["VIXCLS", "VIX"]),
+        rename_to="VIX",
+    )
+    vix3m = _read_macro_csv(
+        data_cfg.vix3m_path,
+        value_col_candidates=getattr(data_cfg, "vix3m_col_candidates", ["VXVCLS", "VIX3M"]),
+        rename_to="VIX3M",
+    )
+    credit = _read_macro_csv(
+        data_cfg.credit_spread_path,
+        value_col_candidates=getattr(data_cfg, "credit_col_candidates", ["Credit_Spread"]),
+        rename_to="Credit_Spread",
+    )
+    return vix, vix3m, credit
+
+
+# =============================================================================
+# Feature engineering
+# =============================================================================
+
+def add_technical_features(df_prices: pd.DataFrame, tickers: List[str], feat_cfg) -> pd.DataFrame:
+    """Add per-asset technical features required by the environment."""
+    df = df_prices.copy()
+
+    try:
+        import talib  # type: ignore
+    except Exception as e:
+        raise ImportError(
+            "talib is required for RSI features (pip install TA-Lib / ta-lib). "
+            f"Import error: {e}"
+        )
+
+    for t in tickers:
+        close = df[t].astype(float)
+
+        # RSI
+        rsi = talib.RSI(close.values, timeperiod=int(feat_cfg.rsi_period))
+        df[f"{t}_RSI"] = (rsi - 50.0) / 50.0
+
+        # Volatility (rolling std of log returns)
+        log_ret = np.log(close).diff()
+        vol = log_ret.rolling(int(feat_cfg.volatility_window)).std()
+        df[f"{t}_volatility"] = (vol * np.sqrt(252)).clip(0.0, 2.0)
+
+    return df
+
+
+def add_macro_features(df: pd.DataFrame, data_cfg, feat_cfg) -> pd.DataFrame:
+    """Join macro series and compute macro features required by the environment."""
+    vix, vix3m, credit = load_macro_data(data_cfg)
+
+    macro = vix.join(vix3m, how="outer").join(credit, how="outer")
+    df2 = df.join(macro, how=getattr(data_cfg, "macro_join_how", "left"))
+
+    if getattr(data_cfg, "macro_ffill", True):
+        df2["VIX"] = df2["VIX"].ffill()
+        df2["VIX3M"] = df2["VIX3M"].ffill()
+        df2["Credit_Spread"] = df2["Credit_Spread"].ffill()
+
+    # -----------------
+    # VIX features
+    # -----------------
+    vix_baseline = float(feat_cfg.vix_baseline)
+    df2["VIX_normalized"] = (df2["VIX"] - vix_baseline) / vix_baseline
+
+    low = float(feat_cfg.vix_regime_low)
+    high = float(feat_cfg.vix_regime_high)
+    df2["VIX_regime"] = np.where(df2["VIX"] < low, -1.0, np.where(df2["VIX"] < high, 0.0, 1.0))
+
+    # term structure: (VIX3M - VIX) / VIX, clipped
+    ts = (df2["VIX3M"] - df2["VIX"]) / (df2["VIX"] + 1e-8)
+    clip = float(getattr(feat_cfg, "vix_term_structure_clip", 1.0))
+    df2["VIX_term_structure"] = np.clip(ts, -clip, clip)
+
+    # -----------------
+    # Credit spread features
+    # -----------------
+    credit_baseline = float(feat_cfg.credit_baseline)
+    df2["Credit_Spread_normalized"] = (df2["Credit_Spread"] - credit_baseline) / (credit_baseline + 1e-8)
+
+    c_low = float(feat_cfg.credit_regime_low)
+    c_high = float(feat_cfg.credit_regime_high)
+    df2["Credit_Spread_regime"] = np.where(df2["Credit_Spread"] < c_low, -1.0, np.where(df2["Credit_Spread"] < c_high, 0.0, 1.0))
+
+    # momentum
+    mom_win = int(feat_cfg.credit_momentum_window)
+    momentum = df2["Credit_Spread"].pct_change(mom_win)
+    df2["Credit_Spread_momentum"] = np.clip(momentum, -float(feat_cfg.credit_momentum_clip), float(feat_cfg.credit_momentum_clip))
+
+    # z-score
+    z_win = int(feat_cfg.credit_zscore_window)
+    roll_mean = df2["Credit_Spread"].rolling(z_win).mean()
+    roll_std = df2["Credit_Spread"].rolling(z_win).std()
+    z = (df2["Credit_Spread"] - roll_mean) / (roll_std + 1e-8)
+    df2["Credit_Spread_zscore"] = np.clip(z, -float(feat_cfg.credit_zscore_clip), float(feat_cfg.credit_zscore_clip))
+
+    # velocity
+    lag = int(feat_cfg.credit_velocity_lag)
+    vel = df2["Credit_Spread_momentum"].diff(lag)
+    df2["Credit_Spread_velocity"] = np.clip(vel, -float(feat_cfg.credit_velocity_clip), float(feat_cfg.credit_velocity_clip))
+
+    # credit-vix divergence (z-score style on shorter window)
+    d_win = int(feat_cfg.credit_divergence_window)
+    vix_norm = (df2["VIX"] - df2["VIX"].rolling(d_win).mean()) / (df2["VIX"].rolling(d_win).std() + 1e-8)
+    cred_norm = (df2["Credit_Spread"] - df2["Credit_Spread"].rolling(d_win).mean()) / (df2["Credit_Spread"].rolling(d_win).std() + 1e-8)
+    div = vix_norm - cred_norm
+    df2["Credit_VIX_divergence"] = np.clip(div, -float(feat_cfg.credit_divergence_clip), float(feat_cfg.credit_divergence_clip))
+
+    return df2
+
+
+def build_feature_dataframe(cfg) -> pd.DataFrame:
+    """End-to-end: download prices, add technical + macro features, and clean NAs."""
+    tickers = list(cfg.data.tickers)
+    df_prices = load_market_data(tickers, cfg.data.start_date, cfg.data.end_date, auto_adjust=True, progress=False)
+
+    df = add_technical_features(df_prices, tickers, cfg.features)
+    df = add_macro_features(df, cfg.data, cfg.features)
+
+    # Final cleaning: drop rows with any missing required features/prices
+    required_cols = tickers + cfg.env.build_feature_columns(tickers, cfg.features)
+    df = df.dropna(subset=required_cols).copy()
+
+    return df
+
+
+# =============================================================================
+# Train / test split + canonical entrypoint for train/eval
+# =============================================================================
+
+def split_train_test(df: pd.DataFrame, train_split_ratio: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Time-series split (no shuffling)."""
+    if not (0.0 < train_split_ratio < 1.0):
+        raise ValueError(f"train_split_ratio must be in (0,1). Got: {train_split_ratio}")
+
+    n = len(df)
+    if n < 10:
+        raise ValueError(f"Not enough rows to split: {n}")
+
+    split_idx = int(np.floor(n * train_split_ratio))
+    split_idx = max(1, min(split_idx, n - 1))
+
+    df_train = df.iloc[:split_idx].copy()
+    df_test = df.iloc[split_idx:].copy()
+    return df_train, df_test
+
+
+def load_and_prepare_data(cfg) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """Canonical entrypoint used by BOTH train.py and evaluate.py.
+
+    Returns:
+        df_train: DataFrame with prices + features
+        df_test:  DataFrame with prices + features
+        feature_cols: list of feature columns (NOT including raw price columns)
+    """
+    df_all = build_feature_dataframe(cfg)
+    df_train, df_test = split_train_test(df_all, float(cfg.data.train_split_ratio))
+
+    tickers = list(cfg.data.tickers)
+    feature_cols = cfg.env.build_feature_columns(tickers, cfg.features)
+
+    # sanity checks
+    missing = [c for c in feature_cols + tickers if c not in df_all.columns]
+    if missing:
+        raise ValueError(f"Missing required columns after pipeline: {missing}")
+
+    return df_train, df_test, feature_cols

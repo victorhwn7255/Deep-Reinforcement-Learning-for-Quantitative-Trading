@@ -1,320 +1,206 @@
+from __future__ import annotations
+
+from typing import Callable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Dirichlet
 
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def _get_activation(name: str) -> Callable[[], nn.Module]:
+    name = (name or "relu").lower()
+    if name == "relu":
+        return nn.ReLU
+    if name == "tanh":
+        return nn.Tanh
+    if name == "elu":
+        return nn.ELU
+    if name == "gelu":
+        return nn.GELU
+    if name == "leaky_relu":
+        return lambda: nn.LeakyReLU(negative_slope=0.01)
+    raise ValueError(f"Unknown activation: {name}")
+
+
+def _xavier_init(m: nn.Module) -> None:
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+
+def build_mlp(
+    in_dim: int,
+    out_dim: int,
+    hidden_size: int,
+    num_layers: int,
+    activation: str = "relu",
+    layer_norm: bool = False,
+    dropout: float = 0.0,
+) -> nn.Sequential:
+    """Generic MLP builder. num_layers counts linear layers including output."""
+    in_dim = int(in_dim)
+    out_dim = int(out_dim)
+    hidden_size = int(hidden_size)
+    num_layers = int(num_layers)
+    if num_layers < 1:
+        raise ValueError("num_layers must be >= 1")
+
+    Act = _get_activation(activation)
+    layers: list[nn.Module] = []
+
+    if num_layers == 1:
+        layers.append(nn.Linear(in_dim, out_dim))
+        return nn.Sequential(*layers)
+
+    # Hidden layers
+    dims = [in_dim] + [hidden_size] * (num_layers - 1)
+    for i in range(num_layers - 1):
+        layers.append(nn.Linear(dims[i], dims[i + 1]))
+        if layer_norm:
+            layers.append(nn.LayerNorm(dims[i + 1]))
+        layers.append(Act())
+        if dropout and dropout > 0.0:
+            layers.append(nn.Dropout(p=float(dropout)))
+
+    # Output layer
+    layers.append(nn.Linear(hidden_size, out_dim))
+    return nn.Sequential(*layers)
+
+
+# =============================================================================
+# Critic Network
+# =============================================================================
+
 class SoftQNetwork(nn.Module):
-    """
-    Soft Q-Network (Critic) for SAC
+    """Q(s,a) critic. Output shape: [B, 1]."""
 
-    Estimates Q(s, a) - the expected return starting from state s,
-    taking action a, and following the policy thereafter.
-
-    SAC uses two Q-networks to mitigate overestimation bias.
-    """
-
-    def __init__(self, n_input, n_action, n_hidden=256):
-        """
-        Initialize Q-network
-
-        Args:
-            n_input: State dimension
-            n_action: Action dimension
-            n_hidden: Number of hidden units
-        """
+    def __init__(self, state_dim: int, action_dim: int, net_cfg):
         super().__init__()
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
 
-        # Q-network takes state-action pair as input
-        self.network = nn.Sequential(
-            nn.Linear(n_input + n_action, n_hidden),
-            nn.ReLU(),
-            nn.Linear(n_hidden, n_hidden),
-            nn.ReLU(),
-            nn.Linear(n_hidden, 1),
+        self.q_net = build_mlp(
+            in_dim=self.state_dim + self.action_dim,
+            out_dim=1,
+            hidden_size=int(net_cfg.hidden_size),
+            num_layers=max(1, int(net_cfg.num_layers)),
+            activation=str(net_cfg.activation),
+            layer_norm=bool(net_cfg.layer_norm),
+            dropout=float(net_cfg.dropout),
         )
+        self.apply(_xavier_init)
 
-        # Initialize weights
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        """Initialize network weights using Xavier initialization"""
-        for layer in self.network:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.constant_(layer.bias, 0.0)
-
-    def forward(self, state, action):
-        """
-        Forward pass
-
-        Args:
-            state: State tensor (batch_size, state_dim)
-            action: Action tensor (batch_size, action_dim)
-
-        Returns:
-            Q-value tensor (batch_size, 1)
-        """
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
         x = torch.cat([state, action], dim=-1)
-        return self.network(x)
+        q = self.q_net(x)
+        if q.dim() == 1:
+            q = q.unsqueeze(1)
+        return q
 
+
+# =============================================================================
+# Policy Network (Dirichlet)
+# =============================================================================
 
 class PolicyNetwork(nn.Module):
-    """Policy Network (Actor) for SAC with a Dirichlet distribution.
+    """Dirichlet policy π(a|s) over simplex (long-only weights incl cash).
 
-    Produces concentration parameters `alpha` for a Dirichlet distribution over portfolio
-    weights (assets + cash). Dirichlet samples lie on the simplex (non-negative and sum to 1).
-
-    Stability / integration notes:
-    - We clamp actions away from exact 0 before computing log_prob to avoid -inf / NaNs.
-    - We renormalize after clamping to preserve the simplex constraint.
-    - MPS backend: Dirichlet rsample/log_prob may be unsupported/unstable for training gradients.
-      This implementation raises if gradients are enabled on MPS to avoid silent failures.
-      Use CPU/CUDA for training with Dirichlet, or switch to a different policy parameterization.
+    Key production fix:
+      - DO NOT clamp/renormalize sampled actions inside sample() before log_prob.
+        Dirichlet samples are already on the simplex.
+      - Provide entropy(state) for Dirichlet-native temperature tuning.
     """
 
-    def __init__(
-        self,
-        n_input: int,
-        n_action: int,
-        n_hidden: int = 256,
-        alpha_min: float = 0.6,
-        alpha_max: float = 100.0,
-        action_eps: float = 1e-8,
-    ):
+    def __init__(self, state_dim: int, action_dim: int, net_cfg):
         super().__init__()
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
 
-        self.n_action = int(n_action)
-        self.alpha_min = float(alpha_min)
-        self.alpha_max = float(alpha_max)
-        self.action_eps = float(action_eps)
+        self.alpha_min = float(net_cfg.alpha_min)
+        self.alpha_max = float(net_cfg.alpha_max)
 
-        # Shared feature extractor
-        self.feature_net = nn.Sequential(
-            nn.Linear(n_input, n_hidden),
-            nn.ReLU(),
-            nn.Linear(n_hidden, n_hidden),
-            nn.ReLU(),
+        self.feature_net = build_mlp(
+            in_dim=self.state_dim,
+            out_dim=int(net_cfg.hidden_size),
+            hidden_size=int(net_cfg.hidden_size),
+            num_layers=max(1, int(net_cfg.num_layers)),
+            activation=str(net_cfg.activation),
+            layer_norm=bool(net_cfg.layer_norm),
+            dropout=float(net_cfg.dropout),
         )
-
-        # Output Dirichlet concentration parameters (alpha)
-        self.alpha_head = nn.Linear(n_hidden, n_action)
-
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        """Initialize network weights."""
-        for layer in self.feature_net:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.constant_(layer.bias, 0.0)
-
-        # Smaller gain for stability; bias=1 encourages near-uniform early allocations.
-        nn.init.xavier_uniform_(self.alpha_head.weight, gain=0.1)
-        nn.init.constant_(self.alpha_head.bias, 1.0)
-
-    @staticmethod
-    def _device_of(x: torch.Tensor):
-        return x.device
-
-    @staticmethod
-    def _ensure_device(x: torch.Tensor, device):
-        """Move x to device if provided and different."""
-        if device is None:
-            return x
-        dev = torch.device(device) if not isinstance(device, torch.device) else device
-        if x.device != dev:
-            return x.to(dev)
-        return x
-
-    @staticmethod
-    def _safe_simplex(action: torch.Tensor, eps: float) -> torch.Tensor:
-        """Clamp away from exact zero and renormalize to sum to 1."""
-        action = torch.clamp(action, min=eps)
-        action = action / action.sum(dim=-1, keepdim=True)
-        return action
+        self.alpha_head = nn.Linear(int(net_cfg.hidden_size), self.action_dim)
+        self.apply(_xavier_init)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        """Compute Dirichlet concentration parameters alpha.
-
-        Returns:
-            alpha: (batch_size, n_action), strictly positive.
-        """
-        features = self.feature_net(state)
-
-        # softplus ensures positivity; add alpha_min to avoid tiny concentrations.
-        alpha = F.softplus(self.alpha_head(features)) + self.alpha_min
-
-        # Prevent extremely large concentrations which can harm exploration / stability.
-        if self.alpha_max is not None:
-            alpha = torch.clamp(alpha, max=self.alpha_max)
-
+        """Return concentration alpha > 0, shape [B, action_dim]."""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        h = self.feature_net(state)
+        raw = self.alpha_head(h)
+        alpha = F.softplus(raw) + self.alpha_min
+        alpha = torch.clamp(alpha, min=self.alpha_min, max=self.alpha_max)
         return alpha
 
-    def sample(self, state: torch.Tensor, device=None):
-        """Sample an action using rsample (reparameterized) and compute its log-prob.
-
+    def sample(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reparameterized sample + log_prob.
         Returns:
-            action: (batch_size, n_action)
-            log_prob: (batch_size,)
-            alpha: (batch_size, n_action)
+          action: [B, action_dim]
+          log_prob: [B, 1]
         """
-        # Keep state (and therefore alpha) on the intended device.
-        state = self._ensure_device(state, device)
-        out_device = state.device
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
 
+        out_device = state.device
         alpha = self.forward(state)
 
-        # MPS safety: prevent silent actor-gradient failure.
+        # MPS safety: Dirichlet rsample/log_prob gradients are often problematic
         if out_device.type == "mps" and torch.is_grad_enabled():
             raise RuntimeError(
-                "Dirichlet rsample/log_prob may be unsupported on MPS with gradients. "
-                "Use device='cpu' or CUDA for training, or change the policy parameterization."
+                "Dirichlet rsample/log_prob gradients may be unsupported on MPS. Use CPU or CUDA."
             )
 
+        # For eval-only on MPS, compute on CPU and move back
         if out_device.type == "mps":
-            # Evaluation-only fallback: do distribution math on CPU.
             alpha_cpu = alpha.detach().cpu()
             dist = Dirichlet(alpha_cpu)
             action_cpu = dist.rsample()
-            action_cpu = self._safe_simplex(action_cpu, self.action_eps)
-            log_prob_cpu = dist.log_prob(action_cpu)
-            return action_cpu.to(out_device), log_prob_cpu.to(out_device), alpha
+            logp_cpu = dist.log_prob(action_cpu)
+            return action_cpu.to(out_device), logp_cpu.unsqueeze(1).to(out_device)
 
-        # Normal path: keep everything on-device.
         dist = Dirichlet(alpha)
-        action = dist.rsample()
-        action = self._safe_simplex(action, self.action_eps)
-        log_prob = dist.log_prob(action)
+        action = dist.rsample()                # already on simplex
+        logp = dist.log_prob(action)           # exact log_prob of sampled action
+        return action, logp.unsqueeze(1)
 
-        return action, log_prob, alpha
-
-    def evaluate(self, state: torch.Tensor, action: torch.Tensor, device=None):
-        """Evaluate log_prob and entropy of a provided action under the current policy.
-
-        Args:
-            state: (batch_size, state_dim)
-            action: (batch_size, n_action)
-
-        Returns:
-            log_prob: (batch_size,)
-            entropy: (batch_size,)
-        """
-        state = self._ensure_device(state, device)
-        action = self._ensure_device(action, state.device)
-        out_device = state.device
-
-        if not torch.isfinite(action).all():
-            raise ValueError("Non-finite values detected in action during PolicyNetwork.evaluate()")
-
+    def entropy(self, state: torch.Tensor) -> torch.Tensor:
+        """Return policy entropy H(Dir(alpha(s))) as [B,1]."""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
         alpha = self.forward(state)
 
-        # MPS safety: prevent silent actor-gradient failure.
-        if out_device.type == "mps" and torch.is_grad_enabled():
-            raise RuntimeError(
-                "Dirichlet log_prob/entropy may be unsupported on MPS with gradients. "
-                "Use device='cpu' or CUDA for training, or change the policy parameterization."
-            )
-
+        out_device = state.device
         if out_device.type == "mps":
-            # Evaluation-only fallback on CPU.
             alpha_cpu = alpha.detach().cpu()
             dist = Dirichlet(alpha_cpu)
-            action_cpu = action.detach().cpu()
-            action_cpu = self._safe_simplex(action_cpu, self.action_eps)
-            log_prob_cpu = dist.log_prob(action_cpu)
-            entropy_cpu = dist.entropy()
-            return log_prob_cpu.to(out_device), entropy_cpu.to(out_device)
+            ent = dist.entropy()
+            return ent.unsqueeze(1).to(out_device)
 
         dist = Dirichlet(alpha)
-        action = self._safe_simplex(action, self.action_eps)
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
-        return log_prob, entropy
+        return dist.entropy().unsqueeze(1)
 
     def get_deterministic_action(self, state: torch.Tensor) -> torch.Tensor:
-        """Deterministic action (mean of Dirichlet): alpha / sum(alpha)."""
+        """Deterministic proxy = mean of Dirichlet = alpha / alpha0."""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
         alpha = self.forward(state)
-        return alpha / alpha.sum(dim=-1, keepdim=True)
-
-
-class ValueNetwork(nn.Module):
-    """
-    Value Network for SAC (optional)
-
-    Estimates V(s) - the expected return starting from state s.
-    While the original SAC paper uses a separate value network,
-    later versions compute V from Q and the policy.
-
-    Including it here for stability, as mentioned in the paper.
-    """
-
-    def __init__(self, n_input, n_hidden=256):
-        """
-        Initialize value network
-
-        Args:
-            n_input: State dimension
-            n_hidden: Number of hidden units
-        """
-        super().__init__()
-
-        self.network = nn.Sequential(
-            nn.Linear(n_input, n_hidden),
-            nn.ReLU(),
-            nn.Linear(n_hidden, n_hidden),
-            nn.ReLU(),
-            nn.Linear(n_hidden, 1),
-        )
-
-        # Initialize weights
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        """Initialize network weights"""
-        for layer in self.network:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.constant_(layer.bias, 0.0)
-
-    def forward(self, state):
-        """
-        Forward pass
-
-        Args:
-            state: State tensor
-
-        Returns:
-            V-value tensor
-        """
-        return self.network(state)
-
-
-# For backward compatibility with the naming convention
-class TwinQNetwork(nn.Module):
-    """
-    Twin Q-Networks for SAC
-
-    Wraps two Q-networks and provides convenient access to both.
-    """
-
-    def __init__(self, n_input, n_action, n_hidden=256):
-        super().__init__()
-        self.q1 = SoftQNetwork(n_input, n_action, n_hidden)
-        self.q2 = SoftQNetwork(n_input, n_action, n_hidden)
-
-    def forward(self, state, action):
-        """
-        Get Q-values from both networks
-
-        Returns:
-            q1_value, q2_value
-        """
-        return self.q1(state, action), self.q2(state, action)
-
-    def q1_forward(self, state, action):
-        """Get Q-value from first network only"""
-        return self.q1(state, action)
-
-    def q2_forward(self, state, action):
-        """Get Q-value from second network only"""
-        return self.q2(state, action)
+        return alpha / (alpha.sum(dim=-1, keepdim=True) + 1e-12)

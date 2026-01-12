@@ -1,267 +1,390 @@
-from dataclasses import dataclass
-from typing import List
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict, field, fields
+from typing import Any, Dict, List, Optional
+from pathlib import Path
+import json
+import random
+
+import numpy as np
 import torch
+
+
+# =============================================================================
+# CONFIG STRUCTURE
+# =============================================================================
+
+@dataclass
+class ExperimentConfig:
+    """Experiment / reproducibility knobs."""
+    seed: int = 42
+    run_name: str = "sac_portfolio"
+    output_dir: str = "runs"          # where to store run artifacts (relative path)
+    save_resolved_config: bool = True # write config.json next to checkpoints
+    verbose: bool = True
+
 
 @dataclass
 class DataConfig:
     """Data loading and preprocessing configuration."""
-
-    # Market data
-    tickers: List[str] = None
-    start_date: str = '2010-01-01'
-    end_date: str = '2024-12-31'
+    tickers: List[str] = field(default_factory=lambda: ["VNQ", "SPY", "TLT", "GLD", "BTC-USD"])
+    start_date: str = "2010-01-01"
+    end_date: str = "2024-12-31"
     train_split_ratio: float = 0.8
 
-    # VIX data paths
-    vix_path: str = '../../data/VIX_CLS_2010_2024.csv'
-    vix3m_path: str = '../../data/VIX3M_CLS_2010_2024.csv'
-    credit_spread_path: str = '../../data/Credit_Spread_2010_2024.csv'
+    # External / macro data (relative paths are intentionally allowed)
+    vix_path: str = "../../data/VIX_CLS_2010_2024.csv"
+    vix3m_path: str = "../../data/VIX3M_CLS_2010_2024.csv"
+    credit_spread_path: str = "../../data/CREDIT_SPREAD_2010_2024.csv"
 
-    # Feature engineering parameters
+    # Column names (to tolerate different FRED / vendor exports)
+    vix_col_candidates: List[str] = field(default_factory=lambda: ["VIXCLS", "VIX"])
+    vix3m_col_candidates: List[str] = field(default_factory=lambda: ["VXVCLS", "VIX3M"])
+    credit_col_candidates: List[str] = field(default_factory=lambda: ["Credit_Spread", "CREDIT_SPREAD", "credit_spread", "spread"])
+
+    # How to align & fill macro series
+    macro_join_how: str = "left"
+    macro_ffill: bool = True
+
+
+@dataclass
+class FeatureConfig:
+    """Feature engineering knobs used to build environment state."""
+    # Per-asset features (the environment will build columns as f"{ticker}_{name}")
+    per_asset_feature_names: List[str] = field(default_factory=lambda: ["RSI", "volatility"])
+
+    # Technical feature parameters
     rsi_period: int = 14
     volatility_window: int = 20
 
-    # VIX feature parameters
-    vix_baseline: float = 20.0  # Used for normalization
+    # VIX features
+    vix_baseline: float = 20.0
     vix_regime_low: float = 15.0
     vix_regime_high: float = 25.0
+    vix_term_structure_clip: float = 1.0
 
-    # Credit spread feature parameters
-    credit_baseline: float = 2.0
-    credit_lookback: int = 252
-    credit_regime_low: float = 1.5
-    credit_regime_high: float = 3.5
+    # Credit spread features (values are typically in decimals; e.g. 0.02 = 2%)
+    credit_baseline: float = 0.02
+    credit_regime_low: float = 0.02
+    credit_regime_high: float = 0.04
+    credit_momentum_window: int = 30
+    credit_zscore_window: int = 252
+    credit_divergence_window: int = 60
+    credit_velocity_lag: int = 5
+    credit_zscore_clip: float = 3.0
+    credit_momentum_clip: float = 1.0
+    credit_velocity_clip: float = 1.0
+    credit_divergence_clip: float = 3.0
 
-    def __post_init__(self):
-        """Set default tickers if not provided."""
-        if self.tickers is None:
-            self.tickers = ['VNQ', 'SPY', 'TLT', 'GLD', 'BTC-USD']
+    # Macro feature column names (environment expects these exact names)
+    macro_feature_columns: List[str] = field(default_factory=lambda: [
+        "VIX_normalized",
+        "VIX_regime",
+        "VIX_term_structure",
+        "Credit_Spread_normalized",
+        "Credit_Spread_regime",
+        "Credit_Spread_momentum",
+        "Credit_Spread_zscore",
+        "Credit_Spread_velocity",
+        "Credit_VIX_divergence",
+    ])
 
 
 @dataclass
 class EnvironmentConfig:
     """Trading environment configuration."""
-
-    # State construction
-    lag: int = 5  # Lookback window for state
+    lag: int = 5
     include_position_in_state: bool = True
 
-    # Transaction costs
-    tc_rate: float = 0.0005  # 5 bps per unit turnover
-    tc_fixed: float = 0.0  # Fixed cost per rebalance event
-    turnover_threshold: float = 0.0  # Minimum turnover to trigger costs
-
-    # Turnover calculation
+    # Transaction costs (one-way turnover cost)
+    tc_rate: float = 0.0005          # 5 bps per unit one-way turnover
+    tc_fixed: float = 0.0            # fixed cost per rebalance
+    turnover_threshold: float = 0.0  # ignore tiny rebalances
     turnover_include_cash: bool = False
-    turnover_use_half_factor: bool = True  # Avoid double-counting
+    turnover_use_half_factor: bool = True
 
-    # Reward scaling (stability)
-    reward_scale: float = 100.0  # Scale log returns for better SAC training
+    # Reward shaping
+    reward_scale: float = 10.0
+    reward_clip_min: float = -0.999    # net_return clip BEFORE log1p
+    reward_clip_max: float = 1.0
+
+    # Terminal handling (portfolio tasks are usually time-truncated, not terminal)
+    treat_done_as_truncation: bool = True
+
+    # Optional constraints (future-proofing)
+    allow_short: bool = False
+    allow_leverage: bool = False
+    max_gross_exposure: float = 1.0  # ignored unless leverage enabled
+
+    def build_feature_columns(self, tickers: List[str], features: FeatureConfig) -> List[str]:
+        cols: List[str] = []
+        for t in tickers:
+            for name in features.per_asset_feature_names:
+                cols.append(f"{t}_{name}")
+        cols.extend(features.macro_feature_columns)
+        return cols
 
 
 @dataclass
 class NetworkConfig:
     """Neural network architecture configuration."""
+    hidden_size: int = 256
+    num_layers: int = 2
+    activation: str = "relu"         
+    layer_norm: bool = True
+    dropout: float = 0.0
+    weight_decay: float = 0.0
 
-    # Architecture
-    n_hidden: int = 256  # Hidden layer size for all networks
-
-    # Policy network (Dirichlet)
-    alpha_min: float = 0.6  # Minimum concentration parameter (gradient stability)
-    alpha_max: float = 100.0  # Maximum concentration parameter
-    action_eps: float = 1e-8  # Small epsilon to avoid log(0)
-
+    # Dirichlet policy safety
+    alpha_min: float = 0.6
+    alpha_max: float = 60.0
+    action_eps: float = 1e-8
 
 @dataclass
 class SACConfig:
     """SAC algorithm hyperparameters."""
+    gamma: float = 0.99
+    tau: float = 0.005
 
-    # Core SAC parameters
-    gamma: float = 0.99  # Discount factor
-    tau: float = 0.005  # Soft update coefficient for target networks
-    learning_rate: float = 0.001  # Learning rate for all networks
+    # Optimizers
+    actor_lr: float = 3e-4
+    critic_lr: float = 3e-4
+    alpha_lr: float = 3e-4
 
-    # Entropy tuning
-    alpha: float = 0.2  # Initial entropy coefficient
-    auto_entropy_tuning: bool = True  # Automatically tune alpha
-    target_entropy: float = None  # If None, computed from Dirichlet max entropy
-    target_entropy_margin: float = 0.5  # Margin below max entropy (in nats)
+    # Entropy / temperature
+    init_alpha: float = 0.2
+    auto_entropy_tuning: bool = True
 
-    # Replay buffer
-    buffer_size: int = 1_000_000
+    # If set, overrides auto target entropy
+    target_entropy: Optional[float] = None
+
+    # Dirichlet-native target entropy:
+    # We define target_entropy = H(Dirichlet([c]*K)) - margin
+    dirichlet_entropy_concentration: float = 1.0
+
+    # subtract a small margin to encourage slightly less randomness (0.0 is fine too)
+    target_entropy_margin: float = 0.2
+
+    # Replay / updates
+    buffer_size: int = 420_000
     batch_size: int = 256
+    learning_starts: int = 5000
+    update_frequency: int = 1
+    updates_per_step: int = 1
 
-    # Training schedule
-    learning_starts: int = 3900  # Warmup steps before training
-    update_frequency: int = 1  # How often to update networks (in steps)
-
+    # Stability
+    gradient_clip_norm: float = 1.0
 
 @dataclass
 class TrainingConfig:
     """Training loop configuration."""
+    total_timesteps: int = 900_000
+    log_interval_episodes: int = 10
+    save_interval_episodes: int = 50
 
-    # Training duration
-    total_timesteps: int = 1_500_000
-
-    # Logging and checkpointing
-    log_interval: int = 10  # Log every N episodes
-    save_interval: int = 50  # Save checkpoint every N episodes
-
-    # Paths
+    # Checkpoint paths (relative paths)
     model_dir: str = "models"
     model_path_final: str = "models/sac_portfolio_final.pth"
     model_path_best: str = "models/sac_portfolio_best.pth"
 
-    # Device preference (will be auto-detected if None)
-    device: str = None  # 'cuda', 'cpu', 'mps', or None for auto
+    # Resume / warm start
+    resume_from: Optional[str] = None  # path to checkpoint to resume from
+
+    # Device preference
+    device: Optional[str] = None  # "cuda" | "cpu" | "mps" | None
+
+
+@dataclass
+class EvaluationConfig:
+    """Backtest / evaluation knobs."""
+    model_path: str = "models/sac_portfolio_best.pth"
+    deterministic: bool = True
+    render_plots: bool = True
+    save_plots: bool = True
+    output_dir: str = "eval_outputs"
 
 
 @dataclass
 class Config:
-    """Master configuration combining all sub-configs."""
+    experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    features: FeatureConfig = field(default_factory=FeatureConfig)
+    env: EnvironmentConfig = field(default_factory=EnvironmentConfig)
+    network: NetworkConfig = field(default_factory=NetworkConfig)
+    sac: SACConfig = field(default_factory=SACConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
-    data: DataConfig = None
-    env: EnvironmentConfig = None
-    network: NetworkConfig = None
-    sac: SACConfig = None
-    training: TrainingConfig = None
-
-    def __post_init__(self):
-        """Initialize all sub-configs if not provided."""
-        if self.data is None:
-            self.data = DataConfig()
-        if self.env is None:
-            self.env = EnvironmentConfig()
-        if self.network is None:
-            self.network = NetworkConfig()
-        if self.sac is None:
-            self.sac = SACConfig()
-        if self.training is None:
-            self.training = TrainingConfig()
-
+    # -------------------------
+    # Convenience helpers
+    # -------------------------
     def auto_detect_device(self) -> torch.device:
-        """Auto-detect and return the best available device."""
+        """Pick the best device; avoid MPS for Dirichlet gradients."""
         if self.training.device is not None:
             return torch.device(self.training.device)
 
         if torch.cuda.is_available():
             return torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            # MPS has issues with Dirichlet gradients - use CPU for training
-            print("⚠ WARNING: Apple Silicon (MPS) detected.")
-            print("  Using CPU to avoid MPS-specific issues with Dirichlet.")
+        if torch.backends.mps.is_available():
+            # Dirichlet rsample/log_prob gradients are often problematic on MPS
+            if self.experiment.verbose:
+                print("⚠ WARNING: Apple Silicon (MPS) detected.")
+                print("  Using CPU to avoid MPS issues with Dirichlet gradients.")
             return torch.device("cpu")
-        else:
-            return torch.device("cpu")
+        return torch.device("cpu")
 
-    def print_summary(self):
-        """Print configuration summary."""
+    def compute_target_entropy(self, n_action: int) -> float:
+        """Dirichlet-native target entropy (in the same units as Dirichlet.entropy()).
+
+        If user provides sac.target_entropy, use it.
+        Otherwise, set target to entropy of symmetric Dirichlet([c]*K) minus a margin.
+        """
+        if self.sac.target_entropy is not None:
+            return float(self.sac.target_entropy)
+
+        K = int(max(2, n_action))
+        c = float(getattr(self.sac, "dirichlet_entropy_concentration", 1.0))
+        margin = float(getattr(self.sac, "target_entropy_margin", 0.0))
+
+        from torch.distributions import Dirichlet
+        alpha = torch.full((K,), c, dtype=torch.float32)
+        H = float(Dirichlet(alpha).entropy().item())
+        return float(H - margin)
+
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def save_json(self, path: str) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2, sort_keys=True)
+
+    @staticmethod
+    def load_json(path: str) -> "Config":
+        """
+        Load config from JSON produced by Config.save_json().
+
+        This reconstructs nested dataclasses properly:
+        - experiment: ExperimentConfig
+        - data: DataConfig
+        - features: FeatureConfig
+        - env: EnvironmentConfig
+        - network: NetworkConfig
+        - sac: SACConfig
+        - training: TrainingConfig
+        - evaluation: EvaluationConfig
+
+        It also ignores unknown keys for forward/backward compatibility.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        if not isinstance(raw, dict):
+            raise ValueError(f"Config JSON must be an object/dict, got: {type(raw)}")
+
+        def build_section(cls, key: str):
+            section = raw.get(key, {})
+            if section is None:
+                section = {}
+            if not isinstance(section, dict):
+                # tolerate bad/old formats by falling back to defaults
+                section = {}
+
+            allowed = {fld.name for fld in fields(cls)}
+            kwargs = {k: v for k, v in section.items() if k in allowed}
+            return cls(**kwargs)
+
+        return Config(
+            experiment=build_section(ExperimentConfig, "experiment"),
+            data=build_section(DataConfig, "data"),
+            features=build_section(FeatureConfig, "features"),
+            env=build_section(EnvironmentConfig, "env"),
+            network=build_section(NetworkConfig, "network"),
+            sac=build_section(SACConfig, "sac"),
+            training=build_section(TrainingConfig, "training"),
+            evaluation=build_section(EvaluationConfig, "evaluation"),
+        )
+
+
+    def set_global_seeds(self) -> None:
+        """Seed Python, NumPy, and Torch."""
+        seed = int(self.experiment.seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def ensure_dirs(self) -> None:
+        Path(self.training.model_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.experiment.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.evaluation.output_dir).mkdir(parents=True, exist_ok=True)
+
+    def print_summary(self) -> None:
+        if not self.experiment.verbose:
+            return
+
         print("=" * 80)
         print("CONFIGURATION SUMMARY")
         print("=" * 80)
 
-        print("\nDATA CONFIG:")
-        print(f"  Tickers: {self.data.tickers}")
-        print(f"  Date range: {self.data.start_date} to {self.data.end_date}")
-        print(f"  Train/test split: {self.data.train_split_ratio:.1%}")
+        print("\nEXPERIMENT:")
+        print(f"  run_name: {self.experiment.run_name}")
+        print(f"  seed: {self.experiment.seed}")
 
-        print("\nENVIRONMENT CONFIG:")
-        print(f"  Lag: {self.env.lag}")
-        print(f"  TC rate: {self.env.tc_rate:.6f} ({self.env.tc_rate * 10000:.1f} bps)")
-        print(f"  Reward scale: {self.env.reward_scale:.1f}")
-        print(f"  Include position in state: {self.env.include_position_in_state}")
+        print("\nDATA:")
+        print(f"  tickers: {self.data.tickers}")
+        print(f"  date range: {self.data.start_date} → {self.data.end_date}")
+        print(f"  train split: {self.data.train_split_ratio:.1%}")
+        print(f"  vix_path: {self.data.vix_path}")
+        print(f"  vix3m_path: {self.data.vix3m_path}")
+        print(f"  credit_spread_path: {self.data.credit_spread_path}")
 
-        print("\nNETWORK CONFIG:")
-        print(f"  Hidden size: {self.network.n_hidden}")
-        print(f"  Alpha min/max: {self.network.alpha_min:.1f} / {self.network.alpha_max:.1f}")
+        print("\nFEATURES:")
+        print(f"  rsi_period: {self.features.rsi_period}")
+        print(f"  volatility_window: {self.features.volatility_window}")
+        print(f"  vix_baseline / regimes: {self.features.vix_baseline} / "
+              f"{self.features.vix_regime_low}, {self.features.vix_regime_high}")
+        print(f"  credit baseline / regimes: {self.features.credit_baseline} / "
+              f"{self.features.credit_regime_low}, {self.features.credit_regime_high}")
 
-        print("\nSAC CONFIG:")
-        print(f"  Gamma: {self.sac.gamma:.3f}")
-        print(f"  Tau: {self.sac.tau:.4f}")
-        print(f"  Learning rate: {self.sac.learning_rate:.4f}")
-        print(f"  Batch size: {self.sac.batch_size}")
-        print(f"  Buffer size: {self.sac.buffer_size:,}")
-        print(f"  Auto entropy tuning: {self.sac.auto_entropy_tuning}")
+        print("\nENVIRONMENT:")
+        print(f"  lag: {self.env.lag}")
+        print(f"  include_position_in_state: {self.env.include_position_in_state}")
+        print(f"  tc_rate: {self.env.tc_rate:.6f} ({self.env.tc_rate * 10000:.1f} bps)")
+        print(f"  reward_scale: {self.env.reward_scale:.1f}")
+        print(f"  reward clip: [{self.env.reward_clip_min}, {self.env.reward_clip_max}]")
 
-        print("\nTRAINING CONFIG:")
-        print(f"  Total timesteps: {self.training.total_timesteps:,}")
-        print(f"  Learning starts: {self.sac.learning_starts:,}")
-        print(f"  Model path: {self.training.model_path_final}")
+        print("\nNETWORK:")
+        print(f"  hidden_size: {self.network.hidden_size}")
+        print(f"  num_layers: {self.network.num_layers}")
+        print(f"  activation: {self.network.activation}")
+        print(f"  alpha min/max: {self.network.alpha_min} / {self.network.alpha_max}")
+
+        print("\nSAC:")
+        print(f"  gamma: {self.sac.gamma}")
+        print(f"  tau: {self.sac.tau}")
+        print(f"  batch_size: {self.sac.batch_size}")
+        print(f"  buffer_size: {self.sac.buffer_size:,}")
+        print(f"  learning_starts: {self.sac.learning_starts}")
+        print(f"  update_frequency: {self.sac.update_frequency}")
+        print(f"  updates_per_step: {self.sac.updates_per_step}")
+        print(f"  auto_entropy_tuning: {self.sac.auto_entropy_tuning}")
+        if self.sac.target_entropy is not None:
+            print(f"  target_entropy: {self.sac.target_entropy}")
+        else:
+            c = float(getattr(self.sac, "dirichlet_entropy_concentration", 1.0))
+            m = float(getattr(self.sac, "target_entropy_margin", 0.0))
+            print(f"  target_entropy: (auto Dirichlet; concentration={c}, margin={m})")
+
+        print("\nTRAINING:")
+        print(f"  total_timesteps: {self.training.total_timesteps:,}")
+        print(f"  model_path_final: {self.training.model_path_final}")
+        print(f"  model_path_best: {self.training.model_path_best}")
 
         print("=" * 80)
 
 
-# ============================================================================
-# DEFAULT CONFIGURATION
-# ============================================================================
-
 def get_default_config() -> Config:
-    """Get default configuration for training."""
     return Config()
-
-
-# ============================================================================
-# EXPERIMENT CONFIGURATIONS
-# ============================================================================
-
-def get_low_cost_config() -> Config:
-    """Configuration for low transaction cost environment."""
-    config = get_default_config()
-    config.env.tc_rate = 0.0001  # 1 bps
-    return config
-
-
-def get_high_cost_config() -> Config:
-    """Configuration for high transaction cost environment."""
-    config = get_default_config()
-    config.env.tc_rate = 0.002  # 20 bps
-    config.env.tc_fixed = 0.0001  # Fixed cost penalty
-    return config
-
-
-def get_conservative_config() -> Config:
-    """Configuration for more conservative, stable policy."""
-    config = get_default_config()
-    config.network.alpha_min = 1.0  # Force more diversified portfolios
-    config.sac.target_entropy_margin = 0.2  # Higher entropy target
-    return config
-
-
-def get_fast_training_config() -> Config:
-    """Configuration for faster training (smaller buffer, higher LR)."""
-    config = get_default_config()
-    config.sac.buffer_size = 100_000
-    config.sac.learning_rate = 0.003
-    config.sac.batch_size = 512
-    return config
-
-
-# ============================================================================
-# USAGE EXAMPLES
-# ============================================================================
-
-if __name__ == "__main__":
-    # Example 1: Default config
-    config = get_default_config()
-    config.print_summary()
-
-    print("\n\nExample: Accessing specific parameters:")
-    print(f"Learning rate: {config.sac.learning_rate}")
-    print(f"Tickers: {config.data.tickers}")
-    print(f"Reward scale: {config.env.reward_scale}")
-
-    # Example 2: Custom config
-    print("\n" + "=" * 80)
-    print("CUSTOM CONFIGURATION")
-    print("=" * 80)
-    custom_config = Config(
-        data=DataConfig(
-            tickers=['SPY', 'TLT', 'GLD'],
-            start_date='2015-01-01',
-        ),
-        sac=SACConfig(
-            learning_rate=0.0005,
-            batch_size=128,
-        ),
-    )
-    custom_config.print_summary()
