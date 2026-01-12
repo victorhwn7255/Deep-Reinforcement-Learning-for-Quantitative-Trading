@@ -205,7 +205,7 @@ class Agent:
 
         if self.auto_entropy_tuning and self.log_alpha is not None and self.alpha_optimizer is not None:
             with torch.no_grad():
-                ent = self.policy.entropy(states)  # [B,1]
+                ent = self.policy.entropy(states).detach()  # [B,1]
                 avg_entropy = float(ent.mean().item())
 
             alpha = self.log_alpha.exp()
@@ -214,6 +214,10 @@ class Agent:
             self.alpha_optimizer.zero_grad(set_to_none=True)
             alpha_loss.backward()
             self.alpha_optimizer.step()
+
+            with torch.no_grad():
+                self.log_alpha.clamp_(min=-10.0, max=5.0)
+
             self.alpha = float(self.log_alpha.exp().item())
         else:
             with torch.no_grad():
