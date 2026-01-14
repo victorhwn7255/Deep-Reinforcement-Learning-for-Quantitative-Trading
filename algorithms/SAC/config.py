@@ -97,16 +97,27 @@ class EnvironmentConfig:
     include_position_in_state: bool = True
 
     # Transaction costs (one-way turnover cost)
-    tc_rate: float = 0.0005          # 5 bps per unit one-way turnover
+    tc_rate: float = 0.0001          # 1 bps per unit one-way turnover
     tc_fixed: float = 0.0            # fixed cost per rebalance
     turnover_threshold: float = 0.0  # ignore tiny rebalances
     turnover_include_cash: bool = False
     turnover_use_half_factor: bool = True
 
     # Reward shaping
+    reward_type: str = "linear"        # "log" (Risk-averse), 
+                                    # "linear" (Risk-neutral), 
+                                    # "sharpe", (Risk-adjusted)
+                                    # "exp" (Risk-seeking)
     reward_scale: float = 10.0
-    reward_clip_min: float = -0.999    # net_return clip BEFORE log1p
-    reward_clip_max: float = 1.0
+    reward_clip_min: float = -0.999    # net_return clip BEFORE reward calculation
+    reward_clip_max: float = 5.0       # allow agent have 300% gain
+
+    # For exponential reward (risk-seeking)
+    exp_risk_factor: float = 6.0       # higher = more risk-seeking (2, 3, 5, 6)
+
+    # For Sharpe-style reward
+    sharpe_window: int = 20            # rolling window for volatility calculation
+    risk_free_rate: float = 0.0        # annualized risk-free rate (e.g., 0.02 = 2%)
 
     # Terminal handling (portfolio tasks are usually time-truncated, not terminal)
     treat_done_as_truncation: bool = True
@@ -136,7 +147,7 @@ class NetworkConfig:
     weight_decay: float = 0.0
 
     # Dirichlet policy safety
-    alpha_min: float = 0.6
+    alpha_min: float = 0.1
     alpha_max: float = 60.0
     action_eps: float = 1e-8
 
@@ -152,7 +163,7 @@ class SACConfig:
     alpha_lr: float = 3e-4
 
     # Entropy / temperature
-    init_alpha: float = 0.2
+    init_alpha: float = 0.1
     auto_entropy_tuning: bool = True
 
     # If set, overrides auto target entropy
@@ -163,7 +174,7 @@ class SACConfig:
     dirichlet_entropy_concentration: float = 1.0
 
     # subtract a small margin to encourage slightly less randomness (0.0 is fine too)
-    target_entropy_margin: float = 0.2
+    target_entropy_margin: float = 1.0
 
     # Replay / updates
     buffer_size: int = 420_000

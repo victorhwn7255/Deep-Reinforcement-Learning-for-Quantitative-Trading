@@ -30,7 +30,14 @@ def max_drawdown(eq: np.ndarray) -> float:
     return float(dd.min())
 
 
-def sharpe(net_returns: np.ndarray, ann: int = 252) -> float:
+def sharpe(net_returns: np.ndarray, ann: int = 252, step_size: int = 1) -> float:
+    """Calculate annualized Sharpe ratio.
+
+    Args:
+        net_returns: Array of returns per step
+        ann: Trading days per year (default 252)
+        step_size: Days per step (default 1 for daily, 5 for weekly)
+    """
     r = np.asarray(net_returns, dtype=np.float64)
     if r.size < 2:
         return 0.0
@@ -38,21 +45,37 @@ def sharpe(net_returns: np.ndarray, ann: int = 252) -> float:
     sd = float(np.std(r, ddof=1))
     if sd < 1e-12:
         return 0.0
-    return (mu / sd) * float(np.sqrt(ann))
+    periods_per_year = ann / step_size
+    return (mu / sd) * float(np.sqrt(periods_per_year))
 
 
-def ann_vol(net_returns: np.ndarray, ann: int = 252) -> float:
+def ann_vol(net_returns: np.ndarray, ann: int = 252, step_size: int = 1) -> float:
+    """Calculate annualized volatility.
+
+    Args:
+        net_returns: Array of returns per step
+        ann: Trading days per year (default 252)
+        step_size: Days per step (default 1 for daily, 5 for weekly)
+    """
     r = np.asarray(net_returns, dtype=np.float64)
     if r.size < 2:
         return 0.0
-    return float(np.std(r, ddof=1) * np.sqrt(ann))
+    periods_per_year = ann / step_size
+    return float(np.std(r, ddof=1) * np.sqrt(periods_per_year))
 
 
-def cagr(eq: np.ndarray, ann: int = 252) -> float:
+def cagr(eq: np.ndarray, ann: int = 252, step_size: int = 1) -> float:
+    """Calculate CAGR from equity curve.
+
+    Args:
+        eq: Equity curve array
+        ann: Trading days per year (default 252)
+        step_size: Days per step (default 1 for daily, 5 for weekly)
+    """
     eq = np.asarray(eq, dtype=np.float64)
     if eq.size < 2:
         return 0.0
-    years = (eq.size - 1) / float(ann)
+    years = (eq.size - 1) * step_size / float(ann)
     if years <= 0:
         return 0.0
     return float(eq[-1] ** (1.0 / years) - 1.0)
@@ -202,9 +225,9 @@ def main() -> None:
     net = res["net_returns"]
 
     stats = {
-        "CAGR": cagr(eq),
-        "Sharpe": sharpe(net),
-        "AnnVol": ann_vol(net),
+        "CAGR": cagr(eq, step_size=cfg.env.lag),
+        "Sharpe": sharpe(net, step_size=cfg.env.lag),
+        "AnnVol": ann_vol(net, step_size=cfg.env.lag),
         "MaxDD": max_drawdown(eq),
         "FinalEquity": float(eq[-1]) if eq.size else 1.0,
         "AvgTurnoverOneWay": float(res["turnover_oneway"].mean()) if res["turnover_oneway"].size else 0.0,
