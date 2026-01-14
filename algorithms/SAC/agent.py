@@ -259,6 +259,10 @@ class Agent:
         episode_count = 0
         start_time = time.time()
 
+        # Episode-level tracking
+        episode_net_returns = []
+        episode_turnovers = []
+
         for step in range(int(total_timesteps)):
             self.global_step = step
 
@@ -269,6 +273,10 @@ class Agent:
 
             next_obs, reward, done = env.step(action)
             episode_return += float(reward)
+
+            # Track step-level metrics
+            episode_net_returns.append(env.last_net_return)
+            episode_turnovers.append(env.last_turnover)
 
             self.replay_buffer.add(obs, action, reward, next_obs, float(done))
 
@@ -284,10 +292,16 @@ class Agent:
 
                 if self.cfg.experiment.verbose:
                     elapsed = time.time() - start_time
+
+                    # Calculate episode statistics
+                    max_weight = float(np.max(env.current_weights[:-1])) if len(env.current_weights) > 1 else 0.0
+                    avg_net_return = float(np.mean(episode_net_returns)) if episode_net_returns else 0.0
+                    avg_turnover = float(np.mean(episode_turnovers)) if episode_turnovers else 0.0
+
                     print(
-                        f"global_step={step}  episode={episode_count}  "
-                        f"episode_return={episode_return:.4f}  alpha={self.alpha:.4f}  "
-                        f"elapsed={elapsed/60:.1f}m"
+                        f"ep={episode_count}  step={step}  ret={episode_return:.4f}  "
+                        f"conc={max_weight:.3f}  net_ret={avg_net_return:.4f}  "
+                        f"turn={avg_turnover:.4f}  alpha={self.alpha:.4f}  time={elapsed/60:.1f}m"
                     )
 
                 if len(episode_returns) >= 10:
@@ -302,6 +316,9 @@ class Agent:
                         })
                         os.makedirs(self.cfg.training.model_dir, exist_ok=True)
                         torch.save(best_model_state, self.cfg.training.model_path_best)
+                        if self.cfg.experiment.verbose:
+                            weights_str = ", ".join([f"{w:.3f}" for w in env.current_weights])
+                            print(f"NEW BEST MODEL | 10-ep avg: {avg_return:.4f} | episode: {episode_count} | weights: [{weights_str}]")
 
                 if (episode_count % int(self.cfg.training.save_interval_episodes)) == 0:
                     os.makedirs(self.cfg.training.model_dir, exist_ok=True)
@@ -310,6 +327,8 @@ class Agent:
 
                 obs = env.reset()
                 episode_return = 0.0
+                episode_net_returns = []
+                episode_turnovers = []
             else:
                 obs = next_obs
 

@@ -29,9 +29,13 @@ class Env:
         self.turnover_include_cash = bool(cfg.env.turnover_include_cash)
         self.turnover_use_half_factor = bool(cfg.env.turnover_use_half_factor)
 
+        self.reward_type = str(cfg.env.reward_type)
         self.reward_scale = float(cfg.env.reward_scale)
         self.reward_clip_min = float(cfg.env.reward_clip_min)
         self.reward_clip_max = float(cfg.env.reward_clip_max)
+        self.exp_risk_factor = float(cfg.env.exp_risk_factor)
+        self.sharpe_window = int(cfg.env.sharpe_window)
+        self.risk_free_rate = float(cfg.env.risk_free_rate)
 
         if self.lag <= 0:
             raise ValueError("lag must be a positive integer")
@@ -81,6 +85,9 @@ class Env:
         self.last_gross_return = 0.0
         self.last_net_return = 0.0
 
+        # For Sharpe reward: track recent returns
+        self.recent_returns = []
+
     # ---------------------------
     # Public API
     # ---------------------------
@@ -94,6 +101,7 @@ class Env:
         self.last_tc_cost = 0.0
         self.last_gross_return = 0.0
         self.last_net_return = 0.0
+        self.recent_returns = []
         return self._get_obs()
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool]:
@@ -108,7 +116,11 @@ class Env:
         # Project to simplex (long-only)
         w_tgt = self._project_to_simplex(action)
 
-        next_pos = self.pos + 1
+        ##########################################
+        ### Rebalance every 'lag' days (eg. 5) ###
+        ##########################################
+        next_pos = self.pos + self.lag  
+        
         if next_pos >= len(self.prices):
             # dataset end (truncation)
             return self._get_obs(), 0.0, True
@@ -136,9 +148,13 @@ class Env:
         gross_return = float(np.dot(w_post_trade, asset_returns))
         net_return = gross_return - float(tc_cost)
 
-        # Reward shaping
-        net_return_clipped = float(np.clip(net_return, self.reward_clip_min, self.reward_clip_max))
-        reward = float(self.reward_scale * np.log1p(net_return_clipped))
+        # Track returns for Sharpe calculation
+        self.recent_returns.append(net_return)
+        if len(self.recent_returns) > self.sharpe_window:
+            self.recent_returns.pop(0)
+
+        # Reward calculation based on reward_type
+        reward = self._compute_reward(net_return)
 
         # Drift weights to t+1 after returns
         w_drift = w_post_trade * (1.0 + asset_returns)
@@ -220,3 +236,51 @@ class Env:
         total = float(delta.sum())
         oneway = 0.5 * total if self.turnover_use_half_factor else total
         return float(oneway), float(total)
+
+    def _compute_reward(self, net_return: float) -> float:
+        """Compute reward based on reward_type configuration.
+
+        Args:
+            net_return: Net return after transaction costs
+
+        Returns:
+            Scaled reward value
+        """
+        net_return_clipped = float(np.clip(net_return, self.reward_clip_min, self.reward_clip_max))
+
+        if self.reward_type == "log":
+            # Risk-averse (concave utility)
+            # Penalizes losses more than it rewards gains
+            raw_reward = np.log1p(net_return_clipped)
+
+        elif self.reward_type == "linear":
+            # Risk-neutral
+            # Treats gains and losses symmetrically
+            raw_reward = net_return_clipped
+
+        elif self.reward_type == "exp":
+            # Risk-seeking (convex utility)
+            # Rewards large gains more than it penalizes losses
+            # Higher exp_risk_factor = more aggressive
+            raw_reward = (np.exp(net_return_clipped * self.exp_risk_factor) - 1.0) / self.exp_risk_factor
+
+        elif self.reward_type == "sharpe":
+            # Risk-adjusted return
+            # Encourages high returns with low volatility
+            if len(self.recent_returns) < 2:
+                # Not enough data for std calculation, use simple return
+                raw_reward = net_return_clipped
+            else:
+                mean_return = np.mean(self.recent_returns)
+                std_return = np.std(self.recent_returns)
+
+                # Avoid division by zero
+                if std_return < 1e-8:
+                    raw_reward = net_return_clipped
+                else:
+                    # Sharpe-like reward: (return - risk_free) / volatility
+                    raw_reward = (net_return_clipped - self.risk_free_rate / 252.0) / (std_return + 1e-8)
+        else:
+            raise ValueError(f"Unknown reward_type: {self.reward_type}")
+
+        return float(self.reward_scale * raw_reward)
