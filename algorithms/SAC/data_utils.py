@@ -162,7 +162,7 @@ def load_yield_curve_data(data_cfg) -> pd.DataFrame:
     """
     path = getattr(data_cfg, "yield_curve_path", None)
     if path is None:
-        raise ValueError("DataConfig.yield_curve_path is required when use_yield_curve=True")
+        raise ValueError("DataConfig.yield_curve_path is required for yield curve features")
 
     yc = _read_macro_csv(
         path,
@@ -207,22 +207,17 @@ def add_technical_features(df_prices: pd.DataFrame, tickers: List[str], feat_cfg
 def add_macro_features(df: pd.DataFrame, data_cfg, feat_cfg) -> pd.DataFrame:
     """Join macro series and compute macro features required by the environment."""
     vix, vix3m, credit = load_macro_data(data_cfg)
+    yc = load_yield_curve_data(data_cfg)
 
-    macro = vix.join(vix3m, how="outer").join(credit, how="outer")
-    
-    use_yc = bool(getattr(feat_cfg, "use_yield_curve", False))
-    if use_yc:
-        yc = load_yield_curve_data(data_cfg)
-        macro = macro.join(yc, how="outer")
-    
+    macro = vix.join(vix3m, how="outer").join(credit, how="outer").join(yc, how="outer")
+
     df2 = df.join(macro, how=getattr(data_cfg, "macro_join_how", "left"))
 
     if getattr(data_cfg, "macro_ffill", True):
         df2["VIX"] = df2["VIX"].ffill()
         df2["VIX3M"] = df2["VIX3M"].ffill()
         df2["Credit_Spread"] = df2["Credit_Spread"].ffill()
-        if use_yc:
-            df2["YieldCurve_10Y3M_raw"] = df2["YieldCurve_10Y3M_raw"].ffill()
+        df2["YieldCurve_10Y3M_raw"] = df2["YieldCurve_10Y3M_raw"].ffill()
 
     # -----------------
     # VIX features
@@ -276,16 +271,15 @@ def add_macro_features(df: pd.DataFrame, data_cfg, feat_cfg) -> pd.DataFrame:
     # -----------------
     # Yield curve features
     # -----------------
-    if use_yc:
-        slope = pd.to_numeric(df2["YieldCurve_10Y3M_raw"], errors="coerce").astype(float)
+    slope = pd.to_numeric(df2["YieldCurve_10Y3M_raw"], errors="coerce").astype(float)
 
-        slope_scale = max(float(getattr(feat_cfg, "yield_curve_slope_scale", 3.0)), 1e-8)
-        df2["YieldCurve_10Y3M"] = np.clip(slope / slope_scale, -1.0, 1.0)
+    slope_scale = max(float(getattr(feat_cfg, "yield_curve_slope_scale", 3.0)), 1e-8)
+    df2["YieldCurve_10Y3M"] = np.clip(slope / slope_scale, -1.0, 1.0)
 
-        chg_lag = int(getattr(feat_cfg, "yield_curve_change_lag", 5))
-        chg_scale = max(float(getattr(feat_cfg, "yield_curve_change_scale", 1.0)), 1e-8)
-        delta = slope - slope.shift(chg_lag)
-        df2["YieldCurve_10Y3M_change"] = np.clip(delta / chg_scale, -1.0, 1.0)
+    chg_lag = int(getattr(feat_cfg, "yield_curve_change_lag", 5))
+    chg_scale = max(float(getattr(feat_cfg, "yield_curve_change_scale", 1.0)), 1e-8)
+    delta = slope - slope.shift(chg_lag)
+    df2["YieldCurve_10Y3M_change"] = np.clip(delta / chg_scale, -1.0, 1.0)
 
     return df2
 
@@ -298,17 +292,13 @@ def build_feature_dataframe(cfg) -> pd.DataFrame:
     df = add_technical_features(df_prices, tickers, cfg.features)
     df = add_macro_features(df, cfg.data, cfg.features)
 
-    # Drop NaNs for features that exist at THIS stage (technical + macro + optional yield curve).
+    # Drop NaNs for features that exist at THIS stage (technical + macro).
     base_cols = []
     for t in tickers:
         for name in cfg.features.per_asset_feature_names:
             base_cols.append(f"{t}_{name}")
-    
+
     base_cols.extend(cfg.features.macro_feature_columns)
-    
-    # If yield curve is enabled, ensure these cols are non-NA BEFORE splitting
-    if getattr(cfg.features, "use_yield_curve", False):
-        base_cols.extend(cfg.features.yield_curve_feature_columns)
 
     required_cols = tickers + base_cols
     df = df.dropna(subset=required_cols).copy()

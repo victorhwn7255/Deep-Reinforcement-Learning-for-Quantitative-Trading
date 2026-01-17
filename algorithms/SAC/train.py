@@ -28,14 +28,10 @@ def main():
     print("=" * 60)
 
     cfg = get_default_config()
-    
-    #######################
-    ### Feature Toggles ###
-    #######################
+
+    # Enable HMM regime features
     cfg.features.use_regime_hmm = True
-    cfg.features.use_yield_curve = True
-    cfg.features.yield_curve_change_lag = cfg.env.lag
-     
+
     cfg.ensure_dirs()
     cfg.set_global_seeds()
     device = cfg.auto_detect_device()
@@ -59,19 +55,12 @@ def main():
     print(f"✓ Test  rows: {len(df_test)}")
     print(f"✓ Data prep time: {(time.time() - t0):.1f}s")
     
-    # ---- sanity check for feature toggles ----
-    must_have = []
-    if getattr(cfg.features, "use_regime_hmm", False):
-        must_have += list(getattr(cfg.features, "regime_prob_columns", []))
-    if getattr(cfg.features, "use_yield_curve", False):
-        must_have += list(getattr(cfg.features, "yield_curve_feature_columns", []))
-
-    missing = [c for c in must_have if c not in df_train.columns]
-    if missing:
-        raise ValueError(f"Missing engineered features in df_train: {missing}")
-
+    # ---- sanity check for HMM regime features ----
     if getattr(cfg.features, "use_regime_hmm", False):
         pcols = cfg.features.regime_prob_columns
+        missing = [c for c in pcols if c not in df_train.columns]
+        if missing:
+            raise ValueError(f"Missing HMM regime columns in df_train: {missing}")
         s = df_train[pcols].sum(axis=1)
         print(f"✓ Regime prob sum min/max: {float(s.min()):.6f} / {float(s.max()):.6f}")
 

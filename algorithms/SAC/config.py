@@ -80,15 +80,20 @@ class FeatureConfig:
 
     # Macro feature column names (environment expects these exact names)
     macro_feature_columns: List[str] = field(default_factory=lambda: [
+        # VIX
         "VIX_normalized",
         "VIX_regime",
         "VIX_term_structure",
+        # Credit Spread
         "Credit_Spread_normalized",
         "Credit_Spread_regime",
         "Credit_Spread_momentum",
         "Credit_Spread_zscore",
         "Credit_Spread_velocity",
         "Credit_VIX_divergence",
+        # Yield Curve
+        "YieldCurve_10Y3M",
+        "YieldCurve_10Y3M_change",
     ])
     
     # -------------------------
@@ -116,22 +121,11 @@ class FeatureConfig:
     hmm_tol: float = 1e-4
     hmm_min_var: float = 1e-4
     
-    # -----------------
-    # Yield curve features
-    # -----------------
-    # Adds macro term-spread information (10Y - 3M), useful for rate-cycle / macro regime context.
-    # These columns are only appended to the environment state if use_yield_curve=True.
-    use_yield_curve: bool = False
-
+    # Yield curve feature parameters
     # Raw T10Y3M is in percentage points (e.g., 3.77). Typical range ~[-3, +4].
     yield_curve_slope_scale: float = 3.0
     yield_curve_change_lag: int = 5
     yield_curve_change_scale: float = 1.0
-
-    yield_curve_feature_columns: List[str] = field(default_factory=lambda: [
-        "YieldCurve_10Y3M",
-        "YieldCurve_10Y3M_change",
-    ])
 
 
 @dataclass
@@ -176,15 +170,12 @@ class EnvironmentConfig:
         for t in tickers:
             for name in features.per_asset_feature_names:
                 cols.append(f"{t}_{name}")
-        
+
         cols.extend(features.macro_feature_columns)
-        
+
         if getattr(features, "use_regime_hmm", False):
             cols.extend(list(getattr(features, "regime_prob_columns", [])))
-            
-        if getattr(features, "use_yield_curve", False):
-            cols.extend(list(getattr(features, "yield_curve_feature_columns", [])))
-        
+
         return cols
 
 @dataclass
@@ -419,10 +410,8 @@ class Config:
             print(f"    hmm_n_states: {self.features.hmm_n_states}")
             print(f"    hmm_n_iter: {self.features.hmm_n_iter}")
         # Yield Curve
-        print(f"  use_yield_curve: {self.features.use_yield_curve}")
-        if self.features.use_yield_curve:
-            print(f"    yield_curve_slope_scale: {self.features.yield_curve_slope_scale}")
-            print(f"    yield_curve_change_lag: {self.features.yield_curve_change_lag}")
+        print(f"  yield_curve_slope_scale: {self.features.yield_curve_slope_scale}")
+        print(f"  yield_curve_change_lag: {self.features.yield_curve_change_lag}")
 
         print("\nENVIRONMENT:")
         print(f"  lag: {self.env.lag}")
