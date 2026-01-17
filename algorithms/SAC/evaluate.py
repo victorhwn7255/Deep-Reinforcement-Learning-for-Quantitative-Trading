@@ -194,6 +194,20 @@ def plot_results(cfg: Config, res: Dict[str, np.ndarray], tickers: List[str], ou
 
 def main() -> None:
     cfg = get_default_config()
+    
+    model_path = cfg.evaluation.model_path
+    
+    # Load the exact config used during training if present
+    cfg_path = os.path.join(os.path.dirname(model_path), "config.json")
+    if os.path.exists(cfg_path):
+        cfg = Config.load_json(cfg_path)
+        # Preserve the model_path you intended to evaluate
+        cfg.evaluation.model_path = model_path
+        print(f"✓ Loaded training config: {cfg_path}")
+    else:
+        print(f"⚠ No training config found at: {cfg_path}")
+        print("  Using default config (may cause state_dim mismatch if features differ).")
+    
     cfg.ensure_dirs()
     cfg.set_global_seeds()
 

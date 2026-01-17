@@ -145,6 +145,34 @@ def load_macro_data(data_cfg) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
     return vix, vix3m, credit
 
 
+def _to_percent_points(series: pd.Series) -> pd.Series:
+    """Convert yield-like series to percentage points.
+    FRED is usually already in percent points (3.77). Some vendors use decimals (0.0377).
+    """
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    med = float(s.dropna().median()) if s.dropna().shape[0] > 0 else 0.0
+    if med != 0.0 and abs(med) < 0.5:
+        s = s * 100.0
+    return s
+
+
+def load_yield_curve_data(data_cfg) -> pd.DataFrame:
+    """Load yield curve (10Y - 3M) term spread.
+    Returns a DF indexed by date with 'YieldCurve_10Y3M_raw' (percent points).
+    """
+    path = getattr(data_cfg, "yield_curve_path", None)
+    if path is None:
+        raise ValueError("DataConfig.yield_curve_path is required when use_yield_curve=True")
+
+    yc = _read_macro_csv(
+        path,
+        value_col_candidates=getattr(data_cfg, "yieldcurve_col_candidates", ["T10Y3M"]),
+        rename_to="YieldCurve_10Y3M_raw",
+    )
+    yc["YieldCurve_10Y3M_raw"] = _to_percent_points(yc["YieldCurve_10Y3M_raw"])
+    return yc
+
+
 # =============================================================================
 # Feature engineering
 # =============================================================================
@@ -181,12 +209,20 @@ def add_macro_features(df: pd.DataFrame, data_cfg, feat_cfg) -> pd.DataFrame:
     vix, vix3m, credit = load_macro_data(data_cfg)
 
     macro = vix.join(vix3m, how="outer").join(credit, how="outer")
+    
+    use_yc = bool(getattr(feat_cfg, "use_yield_curve", False))
+    if use_yc:
+        yc = load_yield_curve_data(data_cfg)
+        macro = macro.join(yc, how="outer")
+    
     df2 = df.join(macro, how=getattr(data_cfg, "macro_join_how", "left"))
 
     if getattr(data_cfg, "macro_ffill", True):
         df2["VIX"] = df2["VIX"].ffill()
         df2["VIX3M"] = df2["VIX3M"].ffill()
         df2["Credit_Spread"] = df2["Credit_Spread"].ffill()
+        if use_yc:
+            df2["YieldCurve_10Y3M_raw"] = df2["YieldCurve_10Y3M_raw"].ffill()
 
     # -----------------
     # VIX features
@@ -236,6 +272,20 @@ def add_macro_features(df: pd.DataFrame, data_cfg, feat_cfg) -> pd.DataFrame:
     cred_norm = (df2["Credit_Spread"] - df2["Credit_Spread"].rolling(d_win).mean()) / (df2["Credit_Spread"].rolling(d_win).std() + 1e-8)
     div = vix_norm - cred_norm
     df2["Credit_VIX_divergence"] = np.clip(div, -float(feat_cfg.credit_divergence_clip), float(feat_cfg.credit_divergence_clip))
+    
+    # -----------------
+    # Yield curve features
+    # -----------------
+    if use_yc:
+        slope = pd.to_numeric(df2["YieldCurve_10Y3M_raw"], errors="coerce").astype(float)
+
+        slope_scale = max(float(getattr(feat_cfg, "yield_curve_slope_scale", 3.0)), 1e-8)
+        df2["YieldCurve_10Y3M"] = np.clip(slope / slope_scale, -1.0, 1.0)
+
+        chg_lag = int(getattr(feat_cfg, "yield_curve_change_lag", 5))
+        chg_scale = max(float(getattr(feat_cfg, "yield_curve_change_scale", 1.0)), 1e-8)
+        delta = slope - slope.shift(chg_lag)
+        df2["YieldCurve_10Y3M_change"] = np.clip(delta / chg_scale, -1.0, 1.0)
 
     return df2
 
@@ -248,11 +298,92 @@ def build_feature_dataframe(cfg) -> pd.DataFrame:
     df = add_technical_features(df_prices, tickers, cfg.features)
     df = add_macro_features(df, cfg.data, cfg.features)
 
-    # Final cleaning: drop rows with any missing required features/prices
-    required_cols = tickers + cfg.env.build_feature_columns(tickers, cfg.features)
+    # Drop NaNs for features that exist at THIS stage (technical + macro + optional yield curve).
+    base_cols = []
+    for t in tickers:
+        for name in cfg.features.per_asset_feature_names:
+            base_cols.append(f"{t}_{name}")
+    
+    base_cols.extend(cfg.features.macro_feature_columns)
+    
+    # If yield curve is enabled, ensure these cols are non-NA BEFORE splitting
+    if getattr(cfg.features, "use_yield_curve", False):
+        base_cols.extend(cfg.features.yield_curve_feature_columns)
+
+    required_cols = tickers + base_cols
     df = df.dropna(subset=required_cols).copy()
 
     return df
+
+##################
+### Regime HMM ###
+##################
+def add_regime_hmm_probabilities(df_all: pd.DataFrame, cfg, split_idx: int) -> pd.DataFrame:
+    """
+    Fit HMM on train slice only ([:split_idx]) and append filtered regime probabilities for all rows.
+    """
+    if not getattr(cfg.features, "use_regime_hmm", False):
+        return df_all
+
+    from regime_hmm import fit_gaussian_hmm_em, forward_filter, reorder_states_by_feature
+
+    tickers = list(cfg.data.tickers)
+    obs_ticker = getattr(cfg.features, "hmm_obs_ticker", "SPY")
+    if obs_ticker not in df_all.columns:
+        # fallback: pick first ticker (but ideally keep SPY)
+        obs_ticker = tickers[0]
+
+    # --- core obs: log return + realized vol
+    px = df_all[obs_ticker].astype(float)
+    ret = np.log(px).diff().fillna(0.0)
+
+    rvol_win = int(getattr(cfg.features, "hmm_rvol_window", 20))
+    rvol = ret.rolling(rvol_win).std().fillna(0.0)
+
+    # --- optional macro drivers
+    cols = [ret.values, rvol.values]
+
+    if getattr(cfg.features, "hmm_include_vix", True) and "VIX" in df_all.columns:
+        cols.append(df_all["VIX"].astype(float).ffill().fillna(0.0).values)
+
+    if getattr(cfg.features, "hmm_include_credit_spread", True) and "Credit_Spread" in df_all.columns:
+        cols.append(df_all["Credit_Spread"].astype(float).ffill().fillna(0.0).values)
+
+    if getattr(cfg.features, "hmm_include_vix_term", True) and "VIX_term_structure" in df_all.columns:
+        cols.append(df_all["VIX_term_structure"].astype(float).ffill().fillna(0.0).values)
+
+    X_all = np.column_stack(cols).astype(np.float64)
+
+    # --- Fit strictly on train slice
+    X_train = X_all[:split_idx]
+
+    params, scaler = fit_gaussian_hmm_em(
+        X_train,
+        n_states=int(getattr(cfg.features, "hmm_n_states", 3)),
+        n_iter=int(getattr(cfg.features, "hmm_n_iter", 50)),
+        tol=float(getattr(cfg.features, "hmm_tol", 1e-4)),
+        min_var=float(getattr(cfg.features, "hmm_min_var", 1e-4)),
+        seed=int(cfg.experiment.seed),
+    )
+
+    # --- Reorder states by volatility dimension (index=1 => rvol), low->stable
+    params, _perm = reorder_states_by_feature(params, feature_index=1, ascending=True)
+
+    # --- Forward filter on full series in scaled space (filtered probs)
+    X_all_scaled = scaler.transform(X_all)
+    probs, _ll = forward_filter(params, X_all_scaled)
+
+    prob_cols = list(getattr(cfg.features, "regime_prob_columns", [
+        "RegimeP_stable", "RegimeP_trans", "RegimeP_crisis"
+    ]))
+    if len(prob_cols) != probs.shape[1]:
+        raise ValueError(f"regime_prob_columns length must be {probs.shape[1]} got {len(prob_cols)}")
+
+    out = df_all.copy()
+    for i, c in enumerate(prob_cols):
+        out[c] = probs[:, i].astype(np.float32)
+
+    return out
 
 
 # =============================================================================
@@ -285,13 +416,26 @@ def load_and_prepare_data(cfg) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
         feature_cols: list of feature columns (NOT including raw price columns)
     """
     df_all = build_feature_dataframe(cfg)
+
+    # split first (so HMM fit uses train only)
     df_train, df_test = split_train_test(df_all, float(cfg.data.train_split_ratio))
+    split_idx = len(df_train)
+
+    # append regime probs causally
+    if getattr(cfg.features, "use_regime_hmm", False):
+        df_all = add_regime_hmm_probabilities(df_all, cfg, split_idx=split_idx)
+        df_train = df_all.iloc[:split_idx].copy()
+        df_test = df_all.iloc[split_idx:].copy()
 
     tickers = list(cfg.data.tickers)
     feature_cols = cfg.env.build_feature_columns(tickers, cfg.features)
 
-    # sanity checks
-    missing = [c for c in feature_cols + tickers if c not in df_all.columns]
+    # final sanity + dropna including regime columns (if enabled)
+    required = tickers + feature_cols
+    df_train = df_train.dropna(subset=required).copy()
+    df_test = df_test.dropna(subset=required).copy()
+
+    missing = [c for c in required if c not in df_all.columns]
     if missing:
         raise ValueError(f"Missing required columns after pipeline: {missing}")
 

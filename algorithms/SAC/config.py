@@ -36,11 +36,13 @@ class DataConfig:
     vix_path: str = "../../data/VIX_CLS_2010_2024.csv"
     vix3m_path: str = "../../data/VIX3M_CLS_2010_2024.csv"
     credit_spread_path: str = "../../data/CREDIT_SPREAD_2010_2024.csv"
+    yield_curve_path: str = "../../data/YIELD_CURVE_10Y3M_2010_2024.csv"
 
     # Column names (to tolerate different FRED / vendor exports)
     vix_col_candidates: List[str] = field(default_factory=lambda: ["VIXCLS", "VIX"])
     vix3m_col_candidates: List[str] = field(default_factory=lambda: ["VXVCLS", "VIX3M"])
     credit_col_candidates: List[str] = field(default_factory=lambda: ["Credit_Spread", "CREDIT_SPREAD", "credit_spread", "spread"])
+    yieldcurve_col_candidates: List[str] = field(default_factory=lambda: [ "T10Y3M", "10Y3M", "10Y_3M", "YieldCurve", "yield_curve", "slope"])
 
     # How to align & fill macro series
     macro_join_how: str = "left"
@@ -88,6 +90,48 @@ class FeatureConfig:
         "Credit_Spread_velocity",
         "Credit_VIX_divergence",
     ])
+    
+    # -------------------------
+    # Regime HMM 
+    # -------------------------
+    use_regime_hmm: bool = False
+
+    # Names of probability columns we will append to df
+    regime_prob_columns: List[str] = field(default_factory=lambda: [
+        "RegimeP_stable",
+        "RegimeP_trans",
+        "RegimeP_crisis",
+    ])
+
+    # HMM observation construction
+    hmm_obs_ticker: str = "SPY"      # use SPY returns/vol as the core
+    hmm_rvol_window: int = 20        # realized vol window (daily)
+    hmm_include_vix: bool = True
+    hmm_include_credit_spread: bool = True
+    hmm_include_vix_term: bool = True  # uses VIX term structure if available
+
+    # HMM fit knobs
+    hmm_n_states: int = 3
+    hmm_n_iter: int = 50
+    hmm_tol: float = 1e-4
+    hmm_min_var: float = 1e-4
+    
+    # -----------------
+    # Yield curve features
+    # -----------------
+    # Adds macro term-spread information (10Y - 3M), useful for rate-cycle / macro regime context.
+    # These columns are only appended to the environment state if use_yield_curve=True.
+    use_yield_curve: bool = False
+
+    # Raw T10Y3M is in percentage points (e.g., 3.77). Typical range ~[-3, +4].
+    yield_curve_slope_scale: float = 3.0
+    yield_curve_change_lag: int = 5
+    yield_curve_change_scale: float = 1.0
+
+    yield_curve_feature_columns: List[str] = field(default_factory=lambda: [
+        "YieldCurve_10Y3M",
+        "YieldCurve_10Y3M_change",
+    ])
 
 
 @dataclass
@@ -132,9 +176,16 @@ class EnvironmentConfig:
         for t in tickers:
             for name in features.per_asset_feature_names:
                 cols.append(f"{t}_{name}")
+        
         cols.extend(features.macro_feature_columns)
+        
+        if getattr(features, "use_regime_hmm", False):
+            cols.extend(list(getattr(features, "regime_prob_columns", [])))
+            
+        if getattr(features, "use_yield_curve", False):
+            cols.extend(list(getattr(features, "yield_curve_feature_columns", [])))
+        
         return cols
-
 
 @dataclass
 class NetworkConfig:
@@ -351,6 +402,7 @@ class Config:
         print(f"  vix_path: {self.data.vix_path}")
         print(f"  vix3m_path: {self.data.vix3m_path}")
         print(f"  credit_spread_path: {self.data.credit_spread_path}")
+        print(f"  yield_curve_path: {self.data.yield_curve_path}")
 
         print("\nFEATURES:")
         print(f"  rsi_period: {self.features.rsi_period}")
@@ -359,11 +411,28 @@ class Config:
               f"{self.features.vix_regime_low}, {self.features.vix_regime_high}")
         print(f"  credit baseline / regimes: {self.features.credit_baseline} / "
               f"{self.features.credit_regime_low}, {self.features.credit_regime_high}")
+        # Regime HMM
+        print(f"  use_regime_hmm: {self.features.use_regime_hmm}")
+        if self.features.use_regime_hmm:
+            print(f"    hmm_obs_ticker: {self.features.hmm_obs_ticker}")
+            print(f"    hmm_rvol_window: {self.features.hmm_rvol_window}")
+            print(f"    hmm_n_states: {self.features.hmm_n_states}")
+            print(f"    hmm_n_iter: {self.features.hmm_n_iter}")
+        # Yield Curve
+        print(f"  use_yield_curve: {self.features.use_yield_curve}")
+        if self.features.use_yield_curve:
+            print(f"    yield_curve_slope_scale: {self.features.yield_curve_slope_scale}")
+            print(f"    yield_curve_change_lag: {self.features.yield_curve_change_lag}")
 
         print("\nENVIRONMENT:")
         print(f"  lag: {self.env.lag}")
         print(f"  include_position_in_state: {self.env.include_position_in_state}")
         print(f"  tc_rate: {self.env.tc_rate:.6f} ({self.env.tc_rate * 10000:.1f} bps)")
+        print(f"  reward_type: {self.env.reward_type}")
+        if self.env.reward_type == "exp":
+            print(f"    exp_risk_factor: {self.env.exp_risk_factor}")
+        if self.env.reward_type == "sharpe":
+            print(f"    sharpe_window: {self.env.sharpe_window}")
         print(f"  reward_scale: {self.env.reward_scale:.1f}")
         print(f"  reward clip: [{self.env.reward_clip_min}, {self.env.reward_clip_max}]")
 
@@ -371,16 +440,20 @@ class Config:
         print(f"  hidden_size: {self.network.hidden_size}")
         print(f"  num_layers: {self.network.num_layers}")
         print(f"  activation: {self.network.activation}")
+        print(f"  layer_norm: {self.network.layer_norm}")
+        print(f"  dropout: {self.network.dropout}")
         print(f"  alpha min/max: {self.network.alpha_min} / {self.network.alpha_max}")
 
         print("\nSAC:")
         print(f"  gamma: {self.sac.gamma}")
         print(f"  tau: {self.sac.tau}")
+        print(f"  lr (actor/critic/alpha): {self.sac.actor_lr} / {self.sac.critic_lr} / {self.sac.alpha_lr}")
         print(f"  batch_size: {self.sac.batch_size}")
         print(f"  buffer_size: {self.sac.buffer_size:,}")
         print(f"  learning_starts: {self.sac.learning_starts}")
         print(f"  update_frequency: {self.sac.update_frequency}")
         print(f"  updates_per_step: {self.sac.updates_per_step}")
+        print(f"  gradient_clip_norm: {self.sac.gradient_clip_norm}")
         print(f"  auto_entropy_tuning: {self.sac.auto_entropy_tuning}")
         if self.sac.target_entropy is not None:
             print(f"  target_entropy: {self.sac.target_entropy}")
@@ -391,8 +464,21 @@ class Config:
 
         print("\nTRAINING:")
         print(f"  total_timesteps: {self.training.total_timesteps:,}")
+        print(f"  log_interval_episodes: {self.training.log_interval_episodes}")
+        print(f"  save_interval_episodes: {self.training.save_interval_episodes}")
         print(f"  model_path_final: {self.training.model_path_final}")
         print(f"  model_path_best: {self.training.model_path_best}")
+        if self.training.resume_from:
+            print(f"  resume_from: {self.training.resume_from}")
+        if self.training.device:
+            print(f"  device: {self.training.device}")
+
+        print("\nEVALUATION:")
+        print(f"  model_path: {self.evaluation.model_path}")
+        print(f"  deterministic: {self.evaluation.deterministic}")
+        print(f"  render_plots: {self.evaluation.render_plots}")
+        print(f"  save_plots: {self.evaluation.save_plots}")
+        print(f"  output_dir: {self.evaluation.output_dir}")
 
         print("=" * 80)
 
