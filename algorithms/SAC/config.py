@@ -139,7 +139,7 @@ class EnvironmentConfig:
 @dataclass
 class NetworkConfig:
     """Neural network architecture configuration."""
-    hidden_size: int = 256
+    hidden_size: int = 128
     num_layers: int = 2
     activation: str = "relu"         
     layer_norm: bool = True
@@ -174,7 +174,7 @@ class SACConfig:
     dirichlet_entropy_concentration: float = 1.0
 
     # subtract a small margin to encourage slightly less randomness (0.0 is fine too)
-    target_entropy_margin: float = 1.0
+    target_entropy_margin: float = 1.25
 
     # Replay / updates
     buffer_size: int = 420_000
@@ -189,7 +189,7 @@ class SACConfig:
 @dataclass
 class TrainingConfig:
     """Training loop configuration."""
-    total_timesteps: int = 900_000
+    total_timesteps: int = 600_000
     log_interval_episodes: int = 10
     save_interval_episodes: int = 50
 
