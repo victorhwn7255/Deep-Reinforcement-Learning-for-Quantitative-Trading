@@ -320,7 +320,8 @@ class Agent:
                             weights_str = ", ".join([f"{w:.3f}" for w in env.current_weights])
                             print(f"NEW BEST MODEL | 10-ep avg: {avg_return:.4f} | episode: {episode_count} | weights: [{weights_str}]")
 
-                if (episode_count % int(self.cfg.training.save_interval_episodes)) == 0:
+                # Milestone saving (disabled if save_interval_episodes <= 0)
+                if self.cfg.training.save_interval_episodes > 0 and (episode_count % int(self.cfg.training.save_interval_episodes)) == 0:
                     os.makedirs(self.cfg.training.model_dir, exist_ok=True)
                     ckpt = self.export_state(extra={"episode": episode_count, "global_step": step})
                     torch.save(ckpt, self.cfg.training.model_path_final.replace(".pth", f"_ep{episode_count}.pth"))

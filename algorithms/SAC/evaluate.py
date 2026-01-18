@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 
 from config import get_default_config, Config
 from data_utils import load_and_prepare_data
 from environment import Env
 from agent import Agent
+from analysis.plotting import generate_evaluation_plots
 
 
 def equity_curve(net_returns: np.ndarray) -> np.ndarray:
@@ -121,79 +122,22 @@ def run_backtest(env: Env, agent: Agent, deterministic: bool) -> Dict[str, np.nd
     }
 
 
-def plot_results(cfg: Config, res: Dict[str, np.ndarray], tickers: List[str], out_dir: str) -> None:
-    # Headless-safe backend selection
-    import matplotlib
-    headless = (os.environ.get("DISPLAY", "") == "")
-    if headless or (not cfg.evaluation.render_plots):
-        matplotlib.use("Agg")
-
-    import matplotlib.pyplot as plt
-
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-    equity = res["equity"]
-    net = res["net_returns"]
-    turnover_total = res["turnover_total"]
-    turnover_one = res["turnover_oneway"]
-    weights = res["weights"]
-
-    plt.figure()
-    plt.plot(equity)
-    plt.title("Equity Curve")
-    plt.xlabel("Step")
-    plt.ylabel("Equity ($1 start)")
-    if cfg.evaluation.save_plots:
-        plt.savefig(os.path.join(out_dir, "equity_curve.png"), dpi=150, bbox_inches="tight")
-    if cfg.evaluation.render_plots:
-        plt.show()
-    else:
-        plt.close()
-
-    plt.figure()
-    plt.plot(net)
-    plt.title("Daily Net Returns")
-    plt.xlabel("Step")
-    plt.ylabel("Net Return")
-    if cfg.evaluation.save_plots:
-        plt.savefig(os.path.join(out_dir, "daily_net_returns.png"), dpi=150, bbox_inches="tight")
-    if cfg.evaluation.render_plots:
-        plt.show()
-    else:
-        plt.close()
-
-    plt.figure()
-    plt.plot(turnover_total, label="turnover_total")
-    plt.plot(turnover_one, label="turnover_oneway")
-    plt.title("Turnover")
-    plt.xlabel("Step")
-    plt.ylabel("Turnover")
-    plt.legend()
-    if cfg.evaluation.save_plots:
-        plt.savefig(os.path.join(out_dir, "turnover.png"), dpi=150, bbox_inches="tight")
-    if cfg.evaluation.render_plots:
-        plt.show()
-    else:
-        plt.close()
-
-    if weights.shape[0] > 0:
-        labels = tickers + ["CASH"]
-        avg_w = weights.mean(axis=0)
-        plt.figure()
-        plt.bar(np.arange(len(avg_w)), avg_w)
-        plt.xticks(np.arange(len(avg_w)), labels, rotation=45, ha="right")
-        plt.title("Average Weights")
-        plt.ylabel("Weight")
-        if cfg.evaluation.save_plots:
-            plt.savefig(os.path.join(out_dir, "avg_weights.png"), dpi=150, bbox_inches="tight")
-        if cfg.evaluation.render_plots:
-            plt.show()
-        else:
-            plt.close()
-
-
 def main() -> None:
     cfg = get_default_config()
+    
+    model_path = cfg.evaluation.model_path
+    
+    # Load the exact config used during training if present
+    cfg_path = os.path.join(os.path.dirname(model_path), "config.json")
+    if os.path.exists(cfg_path):
+        cfg = Config.load_json(cfg_path)
+        # Preserve the model_path you intended to evaluate
+        cfg.evaluation.model_path = model_path
+        print(f"✓ Loaded training config: {cfg_path}")
+    else:
+        print(f"⚠ No training config found at: {cfg_path}")
+        print("  Using default config (may cause state_dim mismatch if features differ).")
+    
     cfg.ensure_dirs()
     cfg.set_global_seeds()
 
@@ -203,6 +147,21 @@ def main() -> None:
     # Data
     _df_train, df_test, _feature_cols = load_and_prepare_data(cfg)
     print(f"✓ Test rows: {len(df_test)}")
+
+    # Extract dates for time-based plots
+    dates: Optional[pd.DatetimeIndex] = None
+    if "date" in df_test.columns:
+        dates = pd.DatetimeIndex(df_test["date"].values)
+    elif df_test.index.name == "date" or isinstance(df_test.index, pd.DatetimeIndex):
+        dates = pd.DatetimeIndex(df_test.index)
+
+    # Extract regime probabilities if HMM is enabled
+    regime_probs: Optional[np.ndarray] = None
+    if getattr(cfg.features, "use_regime_hmm", False):
+        pcols = cfg.features.regime_prob_columns
+        if all(c in df_test.columns for c in pcols):
+            regime_probs = df_test[pcols].values
+            print(f"✓ Regime probabilities available ({len(pcols)} states)")
 
     # Env + Agent
     env = Env(df_test, cfg.data.tickers, cfg)
@@ -218,7 +177,7 @@ def main() -> None:
     agent.load_model(cfg.evaluation.model_path)
     print(f"✓ Loaded model: {cfg.evaluation.model_path}")
 
-    # Run
+    # Run backtest
     res = run_backtest(env, agent, deterministic=bool(cfg.evaluation.deterministic))
 
     eq = res["equity"]
@@ -235,18 +194,41 @@ def main() -> None:
         "AvgTCCost": float(res["tc_costs"].mean()) if res["tc_costs"].size else 0.0,
     }
 
-    print("\n" + "-" * 60)
+    print("\n" + "=" * 60)
     print("EVALUATION SUMMARY (SAC v2)")
-    print("-" * 60)
+    print("=" * 60)
     for k, v in stats.items():
-        print(f"{k:>18}: {v:.6f}" if isinstance(v, float) else f"{k:>18}: {v}")
+        print(f"  {k:>18}: {v:.6f}" if isinstance(v, float) else f"  {k:>18}: {v}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(cfg.evaluation.output_dir, f"eval_{ts}")
-    print(f"\n✓ Output dir: {out_dir}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Generate thesis-quality plots
+    print("\n" + "=" * 60)
+    print("GENERATING PLOTS")
+    print("=" * 60)
 
     if cfg.evaluation.save_plots or cfg.evaluation.render_plots:
-        plot_results(cfg, res, cfg.data.tickers, out_dir)
+        # Align dates and regime_probs with backtest results (skip first row for initial state)
+        plot_dates = dates[1:] if dates is not None and len(dates) > len(net) else dates
+        plot_regime = regime_probs[1:] if regime_probs is not None and len(regime_probs) > len(net) else regime_probs
+
+        saved_paths = generate_evaluation_plots(
+            results=res,
+            cfg=cfg,
+            out_dir=out_dir,
+            dates=plot_dates,
+            regime_probs=plot_regime,
+            show=cfg.evaluation.render_plots,
+        )
+        print(f"✓ Saved {len(saved_paths)} plots to: {out_dir}")
+        for p in saved_paths:
+            print(f"  - {os.path.basename(p)}")
+
+    print("\n" + "=" * 60)
+    print("EVALUATION COMPLETE")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
