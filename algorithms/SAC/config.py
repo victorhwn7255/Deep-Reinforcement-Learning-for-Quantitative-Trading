@@ -37,12 +37,14 @@ class DataConfig:
     vix3m_path: str = "../../data/VIX3M_CLS_2010_2024.csv"
     credit_spread_path: str = "../../data/CREDIT_SPREAD_2010_2024.csv"
     yield_curve_path: str = "../../data/YIELD_CURVE_10Y3M_2010_2024.csv"
+    dxy_path: str = "../../data/DOLLAR_INDEX_2010_2024.csv"
 
     # Column names (to tolerate different FRED / vendor exports)
     vix_col_candidates: List[str] = field(default_factory=lambda: ["VIXCLS", "VIX"])
     vix3m_col_candidates: List[str] = field(default_factory=lambda: ["VXVCLS", "VIX3M"])
     credit_col_candidates: List[str] = field(default_factory=lambda: ["Credit_Spread", "CREDIT_SPREAD", "credit_spread", "spread"])
     yieldcurve_col_candidates: List[str] = field(default_factory=lambda: [ "T10Y3M", "10Y3M", "10Y_3M", "YieldCurve", "yield_curve", "slope"])
+    dxy_col_candidates: List[str] = field(default_factory=lambda: ["DTWEXBGS", "DXY", "Dollar_Index", "USD"])
 
     # How to align & fill macro series
     macro_join_how: str = "left"
@@ -109,11 +111,15 @@ class FeatureConfig:
     ])
 
     # HMM observation construction
-    hmm_obs_ticker: str = "SPY"      # use SPY returns/vol as the core
-    hmm_rvol_window: int = 20        # realized vol window (daily)
+    hmm_obs_ticker: str = "SPY"      # use SPY returns as the core
+    hmm_include_rvol: bool = False   # include realized vol (redundant with VIX, disabled by default)
+    hmm_rvol_window: int = 20        # realized vol window (only used if hmm_include_rvol=True)
     hmm_include_vix: bool = True
     hmm_include_credit_spread: bool = True
     hmm_include_vix_term: bool = True  # uses VIX term structure if available
+    hmm_include_yc_change: bool = True  # include Δ(T10Y3M) over N days
+    hmm_yc_change_lag: int = 5          # N days for yield curve change
+    hmm_include_dxy: bool = True        # include DXY log return
 
     # HMM fit knobs
     hmm_n_states: int = 3
@@ -231,9 +237,9 @@ class SACConfig:
 @dataclass
 class TrainingConfig:
     """Training loop configuration."""
-    total_timesteps: int = 600_000
+    total_timesteps: int = 690_000
     log_interval_episodes: int = 10
-    save_interval_episodes: int = 50
+    save_interval_episodes: int = 0  # 0 = disabled (only save best + final)
 
     # Checkpoint paths (relative paths)
     model_dir: str = "models"
@@ -406,9 +412,18 @@ class Config:
         print(f"  use_regime_hmm: {self.features.use_regime_hmm}")
         if self.features.use_regime_hmm:
             print(f"    hmm_obs_ticker: {self.features.hmm_obs_ticker}")
-            print(f"    hmm_rvol_window: {self.features.hmm_rvol_window}")
             print(f"    hmm_n_states: {self.features.hmm_n_states}")
             print(f"    hmm_n_iter: {self.features.hmm_n_iter}")
+            print(f"    hmm_include_rvol: {self.features.hmm_include_rvol}")
+            if self.features.hmm_include_rvol:
+                print(f"      hmm_rvol_window: {self.features.hmm_rvol_window}")
+            print(f"    hmm_include_vix: {self.features.hmm_include_vix}")
+            print(f"    hmm_include_credit_spread: {self.features.hmm_include_credit_spread}")
+            print(f"    hmm_include_vix_term: {self.features.hmm_include_vix_term}")
+            print(f"    hmm_include_yc_change: {self.features.hmm_include_yc_change}")
+            if self.features.hmm_include_yc_change:
+                print(f"      hmm_yc_change_lag: {self.features.hmm_yc_change_lag}")
+            print(f"    hmm_include_dxy: {self.features.hmm_include_dxy}")
         # Yield Curve
         print(f"  yield_curve_slope_scale: {self.features.yield_curve_slope_scale}")
         print(f"  yield_curve_change_lag: {self.features.yield_curve_change_lag}")

@@ -4,22 +4,13 @@ import os
 import time
 
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 
 from config import get_default_config
 from data_utils import load_and_prepare_data
 from environment import Env
 from agent import Agent
-
-
-def _maybe_save_fig(cfg, filename: str) -> None:
-    if not cfg.experiment.save_resolved_config:
-        return
-    os.makedirs(cfg.experiment.output_dir, exist_ok=True)
-    out_path = os.path.join(cfg.experiment.output_dir, filename)
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"✓ Saved plot: {out_path}")
+from analysis.plotting import plot_training_returns, plot_training_losses
 
 
 def main():
@@ -54,7 +45,7 @@ def main():
     print(f"✓ Train rows: {len(df_train)}")
     print(f"✓ Test  rows: {len(df_test)}")
     print(f"✓ Data prep time: {(time.time() - t0):.1f}s")
-    
+
     # ---- sanity check for HMM regime features ----
     if getattr(cfg.features, "use_regime_hmm", False):
         pcols = cfg.features.regime_prob_columns
@@ -107,7 +98,21 @@ def main():
         total_timesteps=int(cfg.training.total_timesteps),
     )
     train_time = time.time() - train_start
-    print(f"\n✓ Training complete in {train_time / 60:.1f} minutes")
+
+    # -------------------------
+    # Training Summary
+    # -------------------------
+    print("\n" + "=" * 60)
+    print("TRAINING SUMMARY")
+    print("=" * 60)
+    print(f"  Total time: {train_time / 60:.1f} minutes")
+    print(f"  Episodes completed: {len(episode_returns)}")
+    if episode_returns:
+        print(f"  Final episode return: {episode_returns[-1]:.4f}")
+        print(f"  Best episode return: {max(episode_returns):.4f}")
+        print(f"  Average return (last 10): {np.mean(episode_returns[-10:]):.4f}")
+    if losses:
+        print(f"  Total updates: {len(losses)}")
 
     # -------------------------
     # Save
@@ -127,38 +132,29 @@ def main():
         print("ℹ No best_model_state returned (may occur if <10 episodes or no improvement).")
 
     # -------------------------
-    # Plots
+    # Plots (Thesis Style)
     # -------------------------
     print("\n" + "=" * 60)
-    print("STEP 5: PLOTS")
+    print("STEP 5: TRAINING PLOTS")
     print("=" * 60)
 
+    plot_dir = cfg.experiment.output_dir
+    os.makedirs(plot_dir, exist_ok=True)
+
     if len(episode_returns) > 0:
-        plt.figure()
-        plt.plot(episode_returns)
-        plt.title("Episode Return (Reward Sum)")
-        plt.xlabel("Episode")
-        plt.ylabel("Return")
-        _maybe_save_fig(cfg, f"{cfg.experiment.run_name}_episode_returns.png")
-        plt.show()
+        path = os.path.join(plot_dir, f"{cfg.experiment.run_name}_episode_returns.png")
+        plot_training_returns(episode_returns, path, title="Episode Returns", window=20)
+        print(f"✓ Saved: {path}")
 
     if len(losses) > 0:
-        keys = ["q1_loss", "q2_loss", "policy_loss", "alpha_loss", "avg_logp"]
-        for k in keys:
-            vals = [d[k] for d in losses if k in d]
-            if not vals:
-                continue
-            plt.figure()
-            plt.plot(vals)
-            plt.title(k)
-            plt.xlabel("Update")
-            plt.ylabel(k)
-            _maybe_save_fig(cfg, f"{cfg.experiment.run_name}_{k}.png")
-            plt.show()
+        path = os.path.join(plot_dir, f"{cfg.experiment.run_name}_training_losses.png")
+        plot_training_losses(losses, path)
+        print(f"✓ Saved: {path}")
 
-    print("\nDone.")
+    print("\n" + "=" * 60)
+    print("TRAINING COMPLETE")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
     main()
-

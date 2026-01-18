@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 from scipy.special import logsumexp
-
+from sklearn.cluster import KMeans
 
 @dataclass
 class StandardScaler:
@@ -159,7 +159,6 @@ def fit_gaussian_hmm_em(
     x = scaler.transform(x_train)
 
     # KMeans init (deterministic via random_state)
-    from sklearn.cluster import KMeans
     km = KMeans(n_clusters=n_states, n_init=10, random_state=seed)
     z0 = km.fit_predict(x)
     means = km.cluster_centers_.astype(np.float64)

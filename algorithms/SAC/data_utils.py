@@ -173,6 +173,22 @@ def load_yield_curve_data(data_cfg) -> pd.DataFrame:
     return yc
 
 
+def load_dxy_data(data_cfg) -> pd.DataFrame:
+    """Load Dollar Index (DXY) data.
+    Returns a DF indexed by date with 'DXY_raw' column.
+    """
+    path = getattr(data_cfg, "dxy_path", None)
+    if path is None:
+        raise ValueError("DataConfig.dxy_path is required for DXY features")
+
+    dxy = _read_macro_csv(
+        path,
+        value_col_candidates=getattr(data_cfg, "dxy_col_candidates", ["DTWEXBGS", "DXY", "Dollar_Index", "USD"]),
+        rename_to="DXY_raw",
+    )
+    return dxy
+
+
 # =============================================================================
 # Feature engineering
 # =============================================================================
@@ -211,6 +227,15 @@ def add_macro_features(df: pd.DataFrame, data_cfg, feat_cfg) -> pd.DataFrame:
 
     macro = vix.join(vix3m, how="outer").join(credit, how="outer").join(yc, how="outer")
 
+    # Load DXY if path is configured
+    dxy_path = getattr(data_cfg, "dxy_path", None)
+    if dxy_path and os.path.exists(dxy_path):
+        try:
+            dxy = load_dxy_data(data_cfg)
+            macro = macro.join(dxy, how="outer")
+        except Exception as e:
+            print(f"  ⚠ Failed to load DXY data: {e}")
+
     df2 = df.join(macro, how=getattr(data_cfg, "macro_join_how", "left"))
 
     if getattr(data_cfg, "macro_ffill", True):
@@ -218,6 +243,8 @@ def add_macro_features(df: pd.DataFrame, data_cfg, feat_cfg) -> pd.DataFrame:
         df2["VIX3M"] = df2["VIX3M"].ffill()
         df2["Credit_Spread"] = df2["Credit_Spread"].ffill()
         df2["YieldCurve_10Y3M_raw"] = df2["YieldCurve_10Y3M_raw"].ffill()
+        if "DXY_raw" in df2.columns:
+            df2["DXY_raw"] = df2["DXY_raw"].ffill()
 
     # -----------------
     # VIX features
@@ -308,6 +335,75 @@ def build_feature_dataframe(cfg) -> pd.DataFrame:
 ##################
 ### Regime HMM ###
 ##################
+
+def _print_hmm_summary(
+    params,
+    feature_names: List[str],
+    state_names: List[str],
+    probs_train: np.ndarray,
+    verbose: bool = True,
+) -> None:
+    """Print a summary of the fitted HMM model."""
+    if not verbose:
+        return
+
+    n_states = params.n_states
+    n_features = len(feature_names)
+
+    print("\n" + "=" * 70)
+    print("HMM MODEL SUMMARY")
+    print("=" * 70)
+
+    # Features used
+    print(f"\nObservation Features ({n_features}):")
+    for i, name in enumerate(feature_names):
+        print(f"  [{i}] {name}")
+
+    # State means (in scaled space, but we can show interpretation)
+    print(f"\nState Means (scaled space):")
+    print("-" * 70)
+    header = f"{'Feature':<20}" + "".join(f"{name:>12}" for name in state_names)
+    print(header)
+    print("-" * 70)
+    for i, fname in enumerate(feature_names):
+        row = f"{fname:<20}"
+        for k in range(n_states):
+            row += f"{params.means[k, i]:>12.4f}"
+        print(row)
+
+    # Transition matrix
+    print(f"\nTransition Matrix (row = from, col = to):")
+    print("-" * 50)
+    header = f"{'From/To':<12}" + "".join(f"{name:>12}" for name in state_names)
+    print(header)
+    print("-" * 50)
+    for i, from_name in enumerate(state_names):
+        row = f"{from_name:<12}"
+        for j in range(n_states):
+            row += f"{params.A[i, j]:>12.1%}"
+        print(row)
+
+    # Stickiness (diagonal elements)
+    stickiness = np.mean(np.diag(params.A))
+    print(f"\nAverage Stickiness: {stickiness:.1%}")
+
+    # Initial state distribution
+    print(f"\nInitial State Distribution:")
+    for i, name in enumerate(state_names):
+        print(f"  {name}: {params.pi[i]:.1%}")
+
+    # Regime distribution in training data
+    regime_assignments = np.argmax(probs_train, axis=1)
+    print(f"\nRegime Distribution (Training Data):")
+    total = len(regime_assignments)
+    for k, name in enumerate(state_names):
+        count = np.sum(regime_assignments == k)
+        pct = count / total * 100
+        print(f"  {name}: {count:,} days ({pct:.1f}%)")
+
+    print("=" * 70 + "\n")
+
+
 def add_regime_hmm_probabilities(df_all: pd.DataFrame, cfg, split_idx: int) -> pd.DataFrame:
     """
     Fit HMM on train slice only ([:split_idx]) and append filtered regime probabilities for all rows.
@@ -317,35 +413,72 @@ def add_regime_hmm_probabilities(df_all: pd.DataFrame, cfg, split_idx: int) -> p
 
     from regime_hmm import fit_gaussian_hmm_em, forward_filter, reorder_states_by_feature
 
+    verbose = getattr(cfg.experiment, "verbose", True)
+
     tickers = list(cfg.data.tickers)
     obs_ticker = getattr(cfg.features, "hmm_obs_ticker", "SPY")
     if obs_ticker not in df_all.columns:
         # fallback: pick first ticker (but ideally keep SPY)
         obs_ticker = tickers[0]
 
-    # --- core obs: log return + realized vol
+    # --- core obs: log return (always included)
     px = df_all[obs_ticker].astype(float)
     ret = np.log(px).diff().fillna(0.0)
 
-    rvol_win = int(getattr(cfg.features, "hmm_rvol_window", 20))
-    rvol = ret.rolling(rvol_win).std().fillna(0.0)
+    # --- build observation columns list with feature names
+    cols = [ret.values]
+    feature_names = [f"{obs_ticker}_logret"]
+
+    # --- optional: realized volatility (disabled by default - redundant with VIX)
+    if getattr(cfg.features, "hmm_include_rvol", False):
+        rvol_win = int(getattr(cfg.features, "hmm_rvol_window", 20))
+        rvol = ret.rolling(rvol_win).std().fillna(0.0)
+        cols.append(rvol.values)
+        feature_names.append(f"{obs_ticker}_rvol_{rvol_win}d")
 
     # --- optional macro drivers
-    cols = [ret.values, rvol.values]
-
     if getattr(cfg.features, "hmm_include_vix", True) and "VIX" in df_all.columns:
         cols.append(df_all["VIX"].astype(float).ffill().fillna(0.0).values)
+        feature_names.append("VIX")
 
     if getattr(cfg.features, "hmm_include_credit_spread", True) and "Credit_Spread" in df_all.columns:
         cols.append(df_all["Credit_Spread"].astype(float).ffill().fillna(0.0).values)
+        feature_names.append("Credit_Spread")
 
     if getattr(cfg.features, "hmm_include_vix_term", True) and "VIX_term_structure" in df_all.columns:
         cols.append(df_all["VIX_term_structure"].astype(float).ffill().fillna(0.0).values)
+        feature_names.append("VIX_term_struct")
+
+    # --- yield curve change: Δ(T10Y3M) over N days
+    if getattr(cfg.features, "hmm_include_yc_change", True):
+        if "YieldCurve_10Y3M_raw" in df_all.columns:
+            yc_lag = int(getattr(cfg.features, "hmm_yc_change_lag", 5))
+            yc_raw = df_all["YieldCurve_10Y3M_raw"].astype(float).ffill()
+            yc_change = yc_raw.diff(yc_lag).fillna(0.0).values
+            cols.append(yc_change)
+            feature_names.append(f"YC_change_{yc_lag}d")
+        else:
+            print("  ⚠ hmm_include_yc_change=True but YieldCurve_10Y3M_raw not found. "
+                  "Ensure use_yield_curve=True in config.")
+
+    # --- DXY log return
+    if getattr(cfg.features, "hmm_include_dxy", True):
+        if "DXY_raw" in df_all.columns:
+            dxy_px = df_all["DXY_raw"].astype(float).ffill()
+            dxy_logret = np.log(dxy_px).diff().fillna(0.0).values
+            cols.append(dxy_logret)
+            feature_names.append("DXY_logret")
+        else:
+            print("  ⚠ hmm_include_dxy=True but DXY_raw not found in dataframe. "
+                  "Ensure dxy_path is correctly set in config.")
 
     X_all = np.column_stack(cols).astype(np.float64)
 
     # --- Fit strictly on train slice
     X_train = X_all[:split_idx]
+
+    if verbose:
+        print(f"\nFitting HMM on {split_idx:,} training samples with {len(feature_names)} features...")
 
     params, scaler = fit_gaussian_hmm_em(
         X_train,
@@ -356,16 +489,24 @@ def add_regime_hmm_probabilities(df_all: pd.DataFrame, cfg, split_idx: int) -> p
         seed=int(cfg.experiment.seed),
     )
 
-    # --- Reorder states by volatility dimension (index=1 => rvol), low->stable
+    # --- Reorder states by volatility dimension (index=1 => VIX by default), low->stable
+    # Feature order: [ret, (rvol if enabled), VIX, Credit, VIX_term, YC_change, DXY]
+    # With hmm_include_rvol=False (default), VIX is at index=1
     params, _perm = reorder_states_by_feature(params, feature_index=1, ascending=True)
 
     # --- Forward filter on full series in scaled space (filtered probs)
     X_all_scaled = scaler.transform(X_all)
     probs, _ll = forward_filter(params, X_all_scaled)
 
+    # --- Print HMM summary
     prob_cols = list(getattr(cfg.features, "regime_prob_columns", [
         "RegimeP_stable", "RegimeP_trans", "RegimeP_crisis"
     ]))
+    state_names = ["Stable", "Transition", "Crisis"]
+
+    probs_train = probs[:split_idx]
+    _print_hmm_summary(params, feature_names, state_names, probs_train, verbose=verbose)
+
     if len(prob_cols) != probs.shape[1]:
         raise ValueError(f"regime_prob_columns length must be {probs.shape[1]} got {len(prob_cols)}")
 
