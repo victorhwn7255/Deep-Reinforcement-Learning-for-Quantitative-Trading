@@ -1,12 +1,9 @@
 """
-Multi-seed SAC Evaluation Script
 
-Evaluates SAC portfolio models trained with multiple seeds.
-Aggregates metrics and provides statistical summary.
+python evaluate_multiseed.py --run_dir runs/multiseed_5seeds_20240101_120000
+python evaluate_multiseed.py --run_dir runs/multiseed_5seeds_20260118_110501 --per_seed_plots
+python evaluate_multiseed.py --model_paths models/seed_42/sac_best.pth models/seed_123/sac_best.pth
 
-Usage:
-    python evaluate_multiseed.py --run_dir runs/multiseed_5seeds_20240101_120000
-    python evaluate_multiseed.py --model_paths models/seed_42/sac_best.pth models/seed_123/sac_best.pth
 """
 
 from __future__ import annotations
@@ -65,13 +62,23 @@ def print_header(title: str, char: str = "=", width: int = 80) -> None:
 
 
 def extract_seed_from_path(path: str) -> int:
-    """Extract seed number from model path."""
-    # Try to find seed_XXX in path
+    """Extract seed number from model path.
+
+    Expects paths like: .../seed_42/sac_best.pth
+    Extracts seed from the parent directory name to avoid matching
+    patterns like 'multiseed_5seeds' in the run directory name.
+    """
     import re
-    match = re.search(r'seed_(\d+)', path)
+    # Get the parent directory name (e.g., "seed_42" from ".../seed_42/sac_best.pth")
+    parent_dir = os.path.basename(os.path.dirname(path))
+    match = re.match(r'seed_(\d+)', parent_dir)
     if match:
         return int(match.group(1))
-    # Fallback: use hash of path
+    # Fallback: try matching seed_XXX between path separators
+    match = re.search(r'[/\\]seed_(\d+)[/\\]', path)
+    if match:
+        return int(match.group(1))
+    # Final fallback: use hash of path
     return hash(path) % 10000
 
 
@@ -154,15 +161,16 @@ def print_results_table(results: List[EvalResult], aggregated: Dict) -> None:
 
     # Per-seed results
     print("\nPer-Seed Results:")
-    print("-" * 100)
-    print(f"{'Seed':>8} {'Sharpe':>10} {'CAGR':>10} {'MaxDD':>10} {'AnnVol':>10} {'FinalEq':>10} {'Turnover':>10}")
-    print("-" * 100)
+    print("-" * 115)
+    print(f"{'Seed':>8} {'Sharpe':>10} {'CAGR':>10} {'MaxDD':>10} {'AnnVol':>10} {'FinalEq':>10} {'AccumRet':>12} {'Turnover':>10}")
+    print("-" * 115)
 
     for r in sorted(results, key=lambda x: x.seed):
+        accum_equity_pct = r.final_equity * 100  # Total value as percentage of initial (1.0 = 100%)
         print(f"{r.seed:>8} {r.sharpe:>10.3f} {r.cagr:>10.2%} {r.max_dd:>10.2%} "
-              f"{r.ann_vol:>10.2%} {r.final_equity:>10.3f} {r.avg_turnover:>10.4f}")
+              f"{r.ann_vol:>10.2%} {r.final_equity:>10.3f} {accum_equity_pct:>11.2f}% {r.avg_turnover:>10.4f}")
 
-    print("-" * 100)
+    print("-" * 115)
 
     # Aggregated results
     print("\nAggregated Results:")
@@ -272,6 +280,41 @@ def save_results_csv(results: List[EvalResult], aggregated: Dict, output_dir: st
     return csv_path
 
 
+def save_equity_curves_csv(results: List[EvalResult], output_dir: str) -> str:
+    """Save equity curves for all seeds to a single CSV file.
+
+    Creates a CSV with columns: step, seed_X, seed_Y, ..., mean, std
+    This allows for easy plotting and analysis of equity progression.
+    """
+    # Find max length across all equity curves
+    max_len = max(len(r.equity) for r in results if r.equity is not None)
+
+    # Build DataFrame with step index
+    data = {"step": np.arange(max_len)}
+
+    # Add each seed's equity curve (pad shorter ones with NaN)
+    equity_arrays = []
+    for r in results:
+        if r.equity is not None:
+            col_name = f"seed_{r.seed}"
+            padded = np.full(max_len, np.nan)
+            padded[:len(r.equity)] = r.equity
+            data[col_name] = padded
+            equity_arrays.append(padded)
+
+    # Compute mean and std across seeds
+    if equity_arrays:
+        arr = np.array(equity_arrays)
+        data["mean"] = np.nanmean(arr, axis=0)
+        data["std"] = np.nanstd(arr, axis=0)
+
+    df = pd.DataFrame(data)
+    csv_path = os.path.join(output_dir, "equity_curves.csv")
+    df.to_csv(csv_path, index=False)
+
+    return csv_path
+
+
 def generate_multiseed_eval_plots(
     results: List[EvalResult],
     aggregated: Dict,
@@ -333,26 +376,35 @@ def generate_multiseed_eval_plots(
 
 
 def find_models_in_run_dir(run_dir: str) -> List[str]:
-    """Find all best model files in a multi-seed run directory."""
-    patterns = [
-        os.path.join(run_dir, "seed_*", "sac_best.pth"),
-        os.path.join(run_dir, "seed_*", "*_best.pth"),
-    ]
+    """Find all best model files in a multi-seed run directory.
 
-    model_paths = []
-    for pattern in patterns:
-        model_paths.extend(glob(pattern))
+    Searches for model files in priority order to avoid duplicates:
+    1. sac_best.pth (preferred)
+    2. *_best.pth (fallback)
+    3. sac_final.pth (if no best models found)
+    4. *_final.pth (last resort)
+    """
+    # Try specific pattern first (sac_best.pth)
+    pattern = os.path.join(run_dir, "seed_*", "sac_best.pth")
+    model_paths = glob(pattern)
+
+    # If no sac_best.pth found, try wildcard *_best.pth
+    if not model_paths:
+        pattern = os.path.join(run_dir, "seed_*", "*_best.pth")
+        model_paths = glob(pattern)
+
+    # If still nothing, try final models
+    if not model_paths:
+        pattern = os.path.join(run_dir, "seed_*", "sac_final.pth")
+        model_paths = glob(pattern)
 
     if not model_paths:
-        # Try final models
-        patterns_final = [
-            os.path.join(run_dir, "seed_*", "sac_final.pth"),
-            os.path.join(run_dir, "seed_*", "*_final.pth"),
-        ]
-        for pattern in patterns_final:
-            model_paths.extend(glob(pattern))
+        pattern = os.path.join(run_dir, "seed_*", "*_final.pth")
+        model_paths = glob(pattern)
 
-    return sorted(set(model_paths))
+    # Normalize paths for consistent deduplication (important on Windows)
+    normalized = [os.path.normpath(p) for p in model_paths]
+    return sorted(set(normalized))
 
 
 def main():
@@ -384,15 +436,17 @@ def main():
     for p in model_paths:
         print(f"  - {p}")
 
-    # Setup
+    # Setup - load config from first model's directory (preserves training settings)
     cfg = get_default_config()
-    cfg.features.use_regime_hmm = True
-
-    # Try to load config from first model's directory
     first_config_path = os.path.join(os.path.dirname(model_paths[0]), "config.json")
     if os.path.exists(first_config_path):
         cfg = Config.load_json(first_config_path)
         print(f"\nLoaded config from: {first_config_path}")
+    else:
+        print(f"\nWarning: No config.json found at {first_config_path}")
+        print("  Using default config (HMM disabled by default)")
+
+    print(f"HMM Regime Features: {'ENABLED' if cfg.features.use_regime_hmm else 'DISABLED'}")
 
     device = cfg.auto_detect_device()
     print(f"Device: {device}")
@@ -439,6 +493,10 @@ def main():
 
     csv_path = save_results_csv(results, aggregated, output_dir)
     print(f"\nResults saved to: {csv_path}")
+
+    # Save equity curves
+    equity_csv_path = save_equity_curves_csv(results, output_dir)
+    print(f"Equity curves saved to: {equity_csv_path}")
 
     # Generate thesis-quality plots
     if args.save_plots:
