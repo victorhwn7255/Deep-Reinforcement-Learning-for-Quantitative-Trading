@@ -1,11 +1,6 @@
 """
-Multi-seed SAC Training Script
-
-Trains the SAC portfolio agent with multiple random seeds to ensure
-robust and reproducible results. Aggregates metrics across seeds.
-
-Usage:
-    python train_multiseed.py                    # Use default 5 seeds
+    python train_multiseed.py --no-hmm          # NON-HMM training
+    python train_multiseed.py                   # Use default 5 seeds
     python train_multiseed.py --seeds 42 123    # Use specific seeds
     python train_multiseed.py --num_seeds 3     # Use 3 random seeds
 """
@@ -365,6 +360,8 @@ def main():
                         help="Override total_timesteps for each seed")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Custom run name (default: auto-generated)")
+    parser.add_argument("--no-hmm", action="store_true",
+                        help="Disable HMM regime features (for baseline comparison)")
     args = parser.parse_args()
 
     # Determine seeds
@@ -374,13 +371,17 @@ def main():
         # Default 5 seeds
         seeds = [42, 123, 456, 789, 1024][:args.num_seeds]
 
+    # Determine if HMM is enabled
+    use_hmm = not args.no_hmm
+
     print_header("MULTI-SEED SAC PORTFOLIO TRAINING")
     print(f"\nSeeds: {seeds}")
     print(f"Number of seeds: {len(seeds)}")
+    print(f"HMM Regime Features: {'ENABLED' if use_hmm else 'DISABLED'}")
 
     # Setup config
     cfg = get_default_config()
-    cfg.features.use_regime_hmm = True
+    cfg.features.use_regime_hmm = use_hmm
 
     if args.timesteps is not None:
         cfg.training.total_timesteps = args.timesteps
@@ -389,7 +390,8 @@ def main():
 
     # Create run directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = args.run_name or f"multiseed_{len(seeds)}seeds_{timestamp}"
+    hmm_suffix = "hmm" if use_hmm else "no_hmm"
+    run_name = args.run_name or f"multiseed_{len(seeds)}seeds_{hmm_suffix}_{timestamp}"
     run_dir = os.path.join(cfg.experiment.output_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
     print(f"Output directory: {run_dir}")
