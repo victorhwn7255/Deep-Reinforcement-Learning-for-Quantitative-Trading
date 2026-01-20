@@ -1,6 +1,7 @@
 """
     python train_multiseed.py --no-hmm          # NON-HMM training
     python train_multiseed.py                   # Use default 5 seeds
+    python train_multiseed.py --no-hmm --no-yield-curve
     python train_multiseed.py --seeds 42 123    # Use specific seeds
     python train_multiseed.py --num_seeds 3     # Use 3 random seeds
 """
@@ -362,6 +363,8 @@ def main():
                         help="Custom run name (default: auto-generated)")
     parser.add_argument("--no-hmm", action="store_true",
                         help="Disable HMM regime features (for baseline comparison)")
+    parser.add_argument("--no-yield-curve", action="store_true",
+                        help="Disable yield curve features (for ablation study)")
     args = parser.parse_args()
 
     # Determine seeds
@@ -371,17 +374,27 @@ def main():
         # Default 5 seeds
         seeds = [42, 123, 456, 789, 1024][:args.num_seeds]
 
-    # Determine if HMM is enabled
+    # Determine feature flags
     use_hmm = not args.no_hmm
+    use_yield_curve = not args.no_yield_curve
 
     print_header("MULTI-SEED SAC PORTFOLIO TRAINING")
     print(f"\nSeeds: {seeds}")
     print(f"Number of seeds: {len(seeds)}")
     print(f"HMM Regime Features: {'ENABLED' if use_hmm else 'DISABLED'}")
+    print(f"Yield Curve Features: {'ENABLED' if use_yield_curve else 'DISABLED'}")
 
     # Setup config
     cfg = get_default_config()
     cfg.features.use_regime_hmm = use_hmm
+
+    # Remove yield curve features if disabled
+    if not use_yield_curve:
+        yield_curve_cols = ["YieldCurve_10Y3M", "YieldCurve_10Y3M_change"]
+        cfg.features.macro_feature_columns = [
+            col for col in cfg.features.macro_feature_columns
+            if col not in yield_curve_cols
+        ]
 
     if args.timesteps is not None:
         cfg.training.total_timesteps = args.timesteps
@@ -390,8 +403,13 @@ def main():
 
     # Create run directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    hmm_suffix = "hmm" if use_hmm else "no_hmm"
-    run_name = args.run_name or f"multiseed_{len(seeds)}seeds_{hmm_suffix}_{timestamp}"
+    # Build suffix based on enabled features
+    suffix_parts = []
+    suffix_parts.append("hmm" if use_hmm else "no_hmm")
+    if not use_yield_curve:
+        suffix_parts.append("no_yc")
+    feature_suffix = "_".join(suffix_parts)
+    run_name = args.run_name or f"multiseed_{len(seeds)}seeds_{feature_suffix}_{timestamp}"
     run_dir = os.path.join(cfg.experiment.output_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
     print(f"Output directory: {run_dir}")
