@@ -207,15 +207,23 @@ def add_technical_features(df_prices: pd.DataFrame, tickers: List[str], feat_cfg
 
     for t in tickers:
         close = df[t].astype(float)
+        log_price = np.log(close)
 
         # RSI
         rsi = talib.RSI(close.values, timeperiod=int(feat_cfg.rsi_period))
         df[f"{t}_RSI"] = (rsi - 50.0) / 50.0
 
         # Volatility (rolling std of log returns)
-        log_ret = np.log(close).diff()
+        log_ret = log_price.diff()
         vol = log_ret.rolling(int(feat_cfg.volatility_window)).std()
         df[f"{t}_volatility"] = (vol * np.sqrt(252)).clip(0.0, 2.0)
+
+        # 20-day log return (momentum)
+        # log(P_t / P_{t-20}) = log(P_t) - log(P_{t-20})
+        momentum_window = int(getattr(feat_cfg, "momentum_window", 20))
+        ret_20d = log_price.diff(momentum_window)
+        # Clip to [-0.5, 0.5] (~40% move in 20 days is extreme)
+        df[f"{t}_ret_20d"] = ret_20d.clip(-0.5, 0.5)
 
     return df
 
@@ -234,7 +242,7 @@ def add_macro_features(df: pd.DataFrame, data_cfg, feat_cfg) -> pd.DataFrame:
             dxy = load_dxy_data(data_cfg)
             macro = macro.join(dxy, how="outer")
         except Exception as e:
-            print(f"  ⚠ Failed to load DXY data: {e}")
+            print(f"  Failed to load DXY data: {e}")
 
     df2 = df.join(macro, how=getattr(data_cfg, "macro_join_how", "left"))
 
