@@ -265,20 +265,20 @@ class Env:
             raw_reward = (np.exp(net_return_clipped * self.exp_risk_factor) - 1.0) / self.exp_risk_factor
 
         elif self.reward_type == "sharpe":
-            # Risk-adjusted return
-            # Encourages high returns with low volatility
+            # Volatility-adjusted return (Sharpe-like)
+            # Rewards high returns but penalizes when in high-volatility regime
+            # Uses current return (not mean) for immediate RL feedback
             if len(self.recent_returns) < 2:
                 # Not enough data for std calculation, use simple return
                 raw_reward = net_return_clipped
             else:
-                mean_return = np.mean(self.recent_returns)
                 std_return = np.std(self.recent_returns)
 
                 # Avoid division by zero
                 if std_return < 1e-8:
                     raw_reward = net_return_clipped
                 else:
-                    # Sharpe-like reward: (return - risk_free) / volatility
+                    # Volatility-adjusted reward: (return - risk_free) / rolling_volatility
                     raw_reward = (net_return_clipped - self.risk_free_rate / 252.0) / (std_return + 1e-8)
         else:
             raise ValueError(f"Unknown reward_type: {self.reward_type}")

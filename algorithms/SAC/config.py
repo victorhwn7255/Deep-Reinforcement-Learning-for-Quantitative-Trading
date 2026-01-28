@@ -60,17 +60,18 @@ class FeatureConfig:
     # Technical feature parameters
     rsi_period: int = 14
     volatility_window: int = 20
+    momentum_window: int = 20  # window for ret_20d momentum feature
 
     # VIX features
-    vix_baseline: float = 20.0
+    vix_baseline: float = 20
     vix_regime_low: float = 15.0
-    vix_regime_high: float = 25.0
+    vix_regime_high: float = 30.0
     vix_term_structure_clip: float = 1.0
 
     # Credit spread features (values are typically in decimals; e.g. 0.02 = 2%)
-    credit_baseline: float = 0.02
-    credit_regime_low: float = 0.02
-    credit_regime_high: float = 0.04
+    credit_baseline: float = 0.018           #old: 0.02
+    credit_regime_low: float = 0.015         #old: 0.02  
+    credit_regime_high: float = 0.025        #old: 0.04
     credit_momentum_window: int = 30
     credit_zscore_window: int = 252
     credit_divergence_window: int = 60
@@ -202,7 +203,7 @@ class NetworkConfig:
 @dataclass
 class SACConfig:
     """SAC algorithm hyperparameters."""
-    gamma: float = 0.99
+    gamma: float = 0.995
     tau: float = 0.005
 
     # Optimizers
@@ -237,7 +238,7 @@ class SACConfig:
 @dataclass
 class TrainingConfig:
     """Training loop configuration."""
-    total_timesteps: int = 690_000
+    total_timesteps: int = 900_000
     log_interval_episodes: int = 10
     save_interval_episodes: int = 0  # 0 = disabled (only save best + final)
 
@@ -274,9 +275,6 @@ class Config:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
-    # -------------------------
-    # Convenience helpers
-    # -------------------------
     def auto_detect_device(self) -> torch.device:
         """Pick the best device; avoid MPS for Dirichlet gradients."""
         if self.training.device is not None:
@@ -287,7 +285,7 @@ class Config:
         if torch.backends.mps.is_available():
             # Dirichlet rsample/log_prob gradients are often problematic on MPS
             if self.experiment.verbose:
-                print("⚠ WARNING: Apple Silicon (MPS) detected.")
+                print(" WARNING: Apple Silicon (MPS) detected.")
                 print("  Using CPU to avoid MPS issues with Dirichlet gradients.")
             return torch.device("cpu")
         return torch.device("cpu")

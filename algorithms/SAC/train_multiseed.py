@@ -365,6 +365,9 @@ def main():
                         help="Disable HMM regime features (for baseline comparison)")
     parser.add_argument("--no-yield-curve", action="store_true",
                         help="Disable yield curve features (for ablation study)")
+    parser.add_argument("--reward-type", type=str, default="linear",
+                        choices=["linear", "log", "sharpe", "exp"],
+                        help="Reward function type (default: linear)")
     args = parser.parse_args()
 
     # Determine seeds
@@ -377,16 +380,19 @@ def main():
     # Determine feature flags
     use_hmm = not args.no_hmm
     use_yield_curve = not args.no_yield_curve
+    reward_type = args.reward_type
 
     print_header("MULTI-SEED SAC PORTFOLIO TRAINING")
     print(f"\nSeeds: {seeds}")
     print(f"Number of seeds: {len(seeds)}")
     print(f"HMM Regime Features: {'ENABLED' if use_hmm else 'DISABLED'}")
     print(f"Yield Curve Features: {'ENABLED' if use_yield_curve else 'DISABLED'}")
+    print(f"Reward Function: {reward_type.upper()}")
 
     # Setup config
     cfg = get_default_config()
     cfg.features.use_regime_hmm = use_hmm
+    cfg.env.reward_type = reward_type
 
     # Remove yield curve features if disabled
     if not use_yield_curve:
@@ -403,11 +409,13 @@ def main():
 
     # Create run directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Build suffix based on enabled features
+    # Build suffix based on enabled features and reward type
     suffix_parts = []
     suffix_parts.append("hmm" if use_hmm else "no_hmm")
     if not use_yield_curve:
         suffix_parts.append("no_yc")
+    if reward_type != "linear":
+        suffix_parts.append(f"reward_{reward_type}")
     feature_suffix = "_".join(suffix_parts)
     run_name = args.run_name or f"multiseed_{len(seeds)}seeds_{feature_suffix}_{timestamp}"
     run_dir = os.path.join(cfg.experiment.output_dir, run_name)
