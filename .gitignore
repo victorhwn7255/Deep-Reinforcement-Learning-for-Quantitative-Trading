@@ -154,6 +154,8 @@ videos/
 *.pt
 plots/
 results/
+analysis_outputs/
+algorithms/testing/
 
 # macOS
 .DS_Store
@@ -176,6 +178,9 @@ $RECYCLE.BIN/
 # IDE
 .vscode/
 .idea/
+.claude/
+CLAUDE.md
+tasks/
 *.swp
 *.swo
 *~

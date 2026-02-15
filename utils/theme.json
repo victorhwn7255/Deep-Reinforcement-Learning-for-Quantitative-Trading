@@ -1,0 +1,104 @@
+{
+  "_meta": {
+    "description": "Research plot color palette extracted from Color-for-Research-Plots.png",
+    "usage": "Import this theme for consistent, publication-quality matplotlib/seaborn plots",
+    "project": "SAC-Dirichlet Portfolio Optimization"
+  },
+
+  "qualitative": {
+    "description": "6 distinct categorical colors for comparing unordered groups",
+    "colors": ["#FF1F5B", "#00CE6C", "#009BDE", "#AF58B9", "#FFC61D", "#F28422"],
+    "labels": ["pink_red", "green", "blue", "purple", "yellow", "orange"]
+  },
+
+  "red_amber_green": {
+    "description": "3-color traffic-light palette for status/performance indicators",
+    "colors": ["#E9002D", "#FFAA01", "#00B000"],
+    "labels": ["red", "amber", "green"]
+  },
+
+  "sequential": {
+    "blue": {
+      "description": "Single-hue blue, light to dark (7 steps)",
+      "colors": ["#E4F1F7", "#C5E1EF", "#9DC9E2", "#6CB0D5", "#3C92C1", "#226F9D", "#0C4A6F"]
+    },
+    "teal": {
+      "description": "Multi-hue green-to-teal, light to dark (7 steps)",
+      "colors": ["#B8E6A5", "#7DCBA3", "#45AEA0", "#079098", "#00718B", "#045276", "#013147"]
+    },
+    "green": {
+      "description": "Single-hue green, light to dark (7 steps)",
+      "colors": ["#E1F2E2", "#CEE5D3", "#9CCEA8", "#6CBA7E", "#40AD5A", "#228A3B", "#06592B"]
+    },
+    "warm": {
+      "description": "Multi-hue yellow-to-purple, light to dark (7 steps)",
+      "colors": ["#FBE1A4", "#FABF7B", "#F08F6E", "#E05B5C", "#D1295A", "#AB1866", "#6E005F"]
+    },
+    "pink": {
+      "description": "Single-hue pink, light to dark (7 steps)",
+      "colors": ["#F8D8E5", "#F2ABC9", "#EE85B0", "#E85694", "#E42978", "#C4105A", "#8F003A"]
+    },
+    "yellow_red": {
+      "description": "Multi-hue yellow-to-red, light to dark (7 steps)",
+      "colors": ["#FEF3B1", "#FFD976", "#FDB24C", "#FD8C3C", "#FC4E2B", "#E21A1C", "#B00026"]
+    }
+  },
+
+  "diverging": {
+    "teal_pink": {
+      "description": "Teal ↔ Pink diverging (7 steps, neutral center)",
+      "colors": ["#019392", "#39B184", "#9CCB85", "#E9E29C", "#EFB47A", "#E98472", "#CF587E"]
+    },
+    "teal_purple": {
+      "description": "Dark teal ↔ Purple diverging (7 steps, neutral center)",
+      "colors": ["#045276", "#079098", "#7DCBA3", "#FBDE9C", "#EF746D", "#DC3A76", "#7C1D6F"]
+    }
+  },
+
+  "matplotlib_defaults": {
+    "description": "Ready-to-use mappings for common matplotlib/seaborn usage",
+    "cycle": ["#FF1F5B", "#00CE6C", "#009BDE", "#AF58B9", "#FFC61D", "#F28422"],
+    "cmap_sequential": "sequential.teal",
+    "cmap_diverging": "diverging.teal_pink",
+    "background": "#FFFFFF",
+    "text": "#2D3436",
+    "grid": "#E0E0E0",
+    "grid_alpha": 0.5
+  },
+
+  "portfolio_assets": {
+    "description": "Suggested color assignments for the 5 assets + cash",
+    "VNQ":     "#FF1F5B",
+    "SPY":     "#009BDE",
+    "TLT":     "#00CE6C",
+    "GLD":     "#FFC61D",
+    "BTC-USD": "#F28422",
+    "Cash":    "#AF58B9"
+  },
+
+  "regime_colors": {
+    "description": "Colors for HMM regime states",
+    "stable":     "#00CE6C",
+    "transition": "#FFC61D",
+    "crisis":     "#FF1F5B"
+  },
+
+  "ablation_configs": {
+    "description": "Colors for the 4 ablation study configurations",
+    "Full":    "#009BDE",
+    "No_HMM":  "#FF1F5B",
+    "No_YC":   "#FFC61D",
+    "Minimal": "#AF58B9"
+  },
+
+  "performance": {
+    "description": "Colors for performance comparison plots",
+    "agent":       "#009BDE",
+    "benchmark":   "#E0E0E0",
+    "equal_weight": "#F28422",
+    "spy_only":    "#00CE6C",
+    "positive":    "#00B000",
+    "negative":    "#E9002D",
+    "neutral":     "#FFAA01"
+  }
+}
