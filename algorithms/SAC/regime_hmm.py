@@ -138,11 +138,12 @@ def _forward_backward(params: GaussianHMMParams, x: np.ndarray):
 
 def fit_gaussian_hmm_em(
     x_train: np.ndarray,
-    n_states: int = 3,
-    n_iter: int = 50,
+    n_states: int = 4,
+    n_iter: int = 300,
     tol: float = 1e-4,
-    min_var: float = 1e-4,
+    min_var: float = 1e-3,
     seed: int = 42,
+    sticky_diag: float = 0.95,
 ) -> Tuple[GaussianHMMParams, StandardScaler]:
     """
     Fit diagonal Gaussian HMM via EM.
@@ -168,10 +169,10 @@ def fit_gaussian_hmm_em(
         xk = x[z0 == k]
         vars_[k] = (xk.var(axis=0) if xk.shape[0] >= 2 else x.var(axis=0)) + min_var
 
-    # sticky transitions
+    # sticky transitions (configurable diagonal)
     A = np.full((n_states, n_states), 1.0 / n_states, dtype=np.float64)
-    np.fill_diagonal(A, 0.97)
-    off = (1.0 - 0.97) / (n_states - 1)
+    np.fill_diagonal(A, sticky_diag)
+    off = (1.0 - sticky_diag) / (n_states - 1)
     for i in range(n_states):
         for j in range(n_states):
             if i != j:

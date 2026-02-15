@@ -154,6 +154,7 @@ videos/
 *.pt
 plots/
 results/
+runs/
 
 # macOS
 .DS_Store

@@ -1,9 +1,12 @@
 """
-    python train_multiseed.py --no-hmm          # NON-HMM training
-    python train_multiseed.py                   # Use default 5 seeds
-    python train_multiseed.py --no-hmm --no-yield-curve
-    python train_multiseed.py --seeds 42 123    # Use specific seeds
-    python train_multiseed.py --num_seeds 3     # Use 3 random seeds
+    python train_multiseed.py                              # Use default 5 seeds (all features enabled)
+    python train_multiseed.py --no-hmm                     # Disable HMM regime
+    python train_multiseed.py --no-vix-regime              # Disable VIX_regime
+    python train_multiseed.py --no-credit-regime           # Disable Credit_Spread_regime
+    python train_multiseed.py --no-hmm --no-credit-regime  # Only VIX_regime enabled
+    python train_multiseed.py --no-yield-curve             # Disable yield curve features
+    python train_multiseed.py --seeds 42 123               # Use specific seeds
+    python train_multiseed.py --num_seeds 3                # Use 3 random seeds
 """
 
 from __future__ import annotations
@@ -363,6 +366,10 @@ def main():
                         help="Custom run name (default: auto-generated)")
     parser.add_argument("--no-hmm", action="store_true",
                         help="Disable HMM regime features (for baseline comparison)")
+    parser.add_argument("--no-vix-regime", action="store_true",
+                        help="Disable VIX_regime discrete feature")
+    parser.add_argument("--no-credit-regime", action="store_true",
+                        help="Disable Credit_Spread_regime discrete feature")
     parser.add_argument("--no-yield-curve", action="store_true",
                         help="Disable yield curve features (for ablation study)")
     parser.add_argument("--reward-type", type=str, default="linear",
@@ -379,12 +386,16 @@ def main():
 
     # Determine feature flags
     use_hmm = not args.no_hmm
+    use_vix_regime = not args.no_vix_regime
+    use_credit_regime = not args.no_credit_regime
     use_yield_curve = not args.no_yield_curve
     reward_type = args.reward_type
 
     print_header("MULTI-SEED SAC PORTFOLIO TRAINING")
     print(f"\nSeeds: {seeds}")
     print(f"Number of seeds: {len(seeds)}")
+    print(f"VIX Regime Feature: {'ENABLED' if use_vix_regime else 'DISABLED'}")
+    print(f"Credit Regime Feature: {'ENABLED' if use_credit_regime else 'DISABLED'}")
     print(f"HMM Regime Features: {'ENABLED' if use_hmm else 'DISABLED'}")
     print(f"Yield Curve Features: {'ENABLED' if use_yield_curve else 'DISABLED'}")
     print(f"Reward Function: {reward_type.upper()}")
@@ -392,6 +403,8 @@ def main():
     # Setup config
     cfg = get_default_config()
     cfg.features.use_regime_hmm = use_hmm
+    cfg.features.use_vix_regime = use_vix_regime
+    cfg.features.use_credit_regime = use_credit_regime
     cfg.env.reward_type = reward_type
 
     # Remove yield curve features if disabled
@@ -411,7 +424,19 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # Build suffix based on enabled features and reward type
     suffix_parts = []
-    suffix_parts.append("hmm" if use_hmm else "no_hmm")
+    # Regime features
+    regime_parts = []
+    if use_vix_regime:
+        regime_parts.append("vix")
+    if use_credit_regime:
+        regime_parts.append("credit")
+    if use_hmm:
+        regime_parts.append("hmm")
+    if regime_parts:
+        suffix_parts.append("regime_" + "+".join(regime_parts))
+    else:
+        suffix_parts.append("no_regime")
+    # Other features
     if not use_yield_curve:
         suffix_parts.append("no_yc")
     if reward_type != "linear":

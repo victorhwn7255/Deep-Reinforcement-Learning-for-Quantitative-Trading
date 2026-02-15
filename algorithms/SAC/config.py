@@ -35,14 +35,14 @@ class DataConfig:
     # External / macro data (relative paths are intentionally allowed)
     vix_path: str = "../../data/VIX_CLS_2010_2024.csv"
     vix3m_path: str = "../../data/VIX3M_CLS_2010_2024.csv"
-    credit_spread_path: str = "../../data/CREDIT_SPREAD_2010_2024.csv"
+    credit_spread_path: str = "../../data/CREDIT_SPREAD_JUNK_2010_2024.csv"
     yield_curve_path: str = "../../data/YIELD_CURVE_10Y3M_2010_2024.csv"
     dxy_path: str = "../../data/DOLLAR_INDEX_2010_2024.csv"
 
     # Column names (to tolerate different FRED / vendor exports)
     vix_col_candidates: List[str] = field(default_factory=lambda: ["VIXCLS", "VIX"])
     vix3m_col_candidates: List[str] = field(default_factory=lambda: ["VXVCLS", "VIX3M"])
-    credit_col_candidates: List[str] = field(default_factory=lambda: ["Credit_Spread", "CREDIT_SPREAD", "credit_spread", "spread"])
+    credit_col_candidates: List[str] = field(default_factory=lambda: ["BAMLH0A0HYM2", "BAMLC0A4CBBB", "Credit_Spread", "CREDIT_SPREAD", "credit_spread", "spread"])
     yieldcurve_col_candidates: List[str] = field(default_factory=lambda: [ "T10Y3M", "10Y3M", "10Y_3M", "YieldCurve", "yield_curve", "slope"])
     dxy_col_candidates: List[str] = field(default_factory=lambda: ["DTWEXBGS", "DXY", "Dollar_Index", "USD"])
 
@@ -64,14 +64,15 @@ class FeatureConfig:
 
     # VIX features
     vix_baseline: float = 20
-    vix_regime_low: float = 15.0
-    vix_regime_high: float = 30.0
+    vix_regime_low: float = 15.0   # VIX < 15: low vol (-1)
+    vix_regime_high: float = 30.0  # VIX >= 30: high vol (+1)
     vix_term_structure_clip: float = 1.0
 
-    # Credit spread features (values are typically in decimals; e.g. 0.02 = 2%)
-    credit_baseline: float = 0.018           #old: 0.02
-    credit_regime_low: float = 0.015         #old: 0.02  
-    credit_regime_high: float = 0.025        #old: 0.04
+    # Credit spread features (FRED data is in percentage points, e.g. 4.7 = 4.7%)
+    # Using High Yield (Junk Bond) spread: BAMLH0A0HYM2
+    # Stats (2010-2024): Mean=4.71%, Median=4.45%, Min=2.60%, Max=10.87%
+    credit_regime_low: float = 3.42    # spread < 3.42%: risk-on (-1)
+    credit_regime_high: float = 5.99   # spread > 5.99%: risk-off (+1), else elevated (0)
     credit_momentum_window: int = 30
     credit_zscore_window: int = 252
     credit_divergence_window: int = 60
@@ -82,51 +83,58 @@ class FeatureConfig:
     credit_divergence_clip: float = 3.0
 
     # Macro feature column names (environment expects these exact names)
+    # NOTE: VIX_regime and Credit_Spread_regime are added dynamically based on flags below
     macro_feature_columns: List[str] = field(default_factory=lambda: [
         # VIX
         "VIX_normalized",
-        "VIX_regime",
         "VIX_term_structure",
-        # Credit Spread
-        "Credit_Spread_normalized",
-        "Credit_Spread_regime",
-        "Credit_Spread_momentum",
+        # Credit Spread (trend + acceleration + cross-asset)
         "Credit_Spread_zscore",
+        "Credit_Spread_momentum",
         "Credit_Spread_velocity",
         "Credit_VIX_divergence",
         # Yield Curve
         "YieldCurve_10Y3M",
         "YieldCurve_10Y3M_change",
     ])
-    
-    # -------------------------
-    # Regime HMM 
-    # -------------------------
-    use_regime_hmm: bool = False
 
-    # Names of probability columns we will append to df
+    # -------------------------
+    # Discrete Regime Features
+    # -------------------------
+    use_vix_regime: bool = True       # Add VIX_regime feature (-1/0/+1)
+    use_credit_regime: bool = False   # Add Credit_Spread_regime feature (-1/0/+1)
+
+    # -------------------------
+    # Regime HMM
+    # -------------------------
+    use_regime_hmm: bool = False      # Add 4-state HMM probabilities
+
+    # Names of probability columns we will append to df (must match hmm_n_states)
     regime_prob_columns: List[str] = field(default_factory=lambda: [
-        "RegimeP_stable",
-        "RegimeP_trans",
+        "RegimeP_bull",
+        "RegimeP_caution",
+        "RegimeP_stress",
         "RegimeP_crisis",
     ])
 
     # HMM observation construction
     hmm_obs_ticker: str = "SPY"      # use SPY returns as the core
-    hmm_include_rvol: bool = False   # include realized vol (redundant with VIX, disabled by default)
+    hmm_credit_spread_path: str = "../../data/CREDIT_SPREAD_BBB_2010_2024.csv"  # BBB for HMM (independent from SAC's JUNK)
+    hmm_include_rvol: bool = False   # redundant with VIX - disabled
     hmm_rvol_window: int = 20        # realized vol window (only used if hmm_include_rvol=True)
     hmm_include_vix: bool = True
     hmm_include_credit_spread: bool = True
     hmm_include_vix_term: bool = True  # uses VIX term structure if available
-    hmm_include_yc_change: bool = True  # include Δ(T10Y3M) over N days
+    hmm_include_yc_change: bool = True   # include Δ(T10Y3M) over N days
     hmm_yc_change_lag: int = 5          # N days for yield curve change
-    hmm_include_dxy: bool = True        # include DXY log return
+    hmm_include_dxy: bool = False       # DXY disabled - low discriminative power in regime detection
 
     # HMM fit knobs
-    hmm_n_states: int = 3
-    hmm_n_iter: int = 50
+    hmm_n_states: int = 4
+    hmm_n_iter: int = 300
     hmm_tol: float = 1e-4
-    hmm_min_var: float = 1e-4
+    hmm_min_var: float = 1e-3
+    hmm_sticky_diag: float = 0.95  # Diagonal of transition matrix (stickiness)
     
     # Yield curve feature parameters
     # Raw T10Y3M is in percentage points (e.g., 3.77). Typical range ~[-3, +4].
@@ -180,6 +188,13 @@ class EnvironmentConfig:
 
         cols.extend(features.macro_feature_columns)
 
+        # Add discrete regime features if enabled
+        if getattr(features, "use_vix_regime", False):
+            cols.append("VIX_regime")
+        if getattr(features, "use_credit_regime", False):
+            cols.append("Credit_Spread_regime")
+
+        # Add HMM regime probabilities if enabled
         if getattr(features, "use_regime_hmm", False):
             cols.extend(list(getattr(features, "regime_prob_columns", [])))
 
@@ -238,7 +253,7 @@ class SACConfig:
 @dataclass
 class TrainingConfig:
     """Training loop configuration."""
-    total_timesteps: int = 900_000
+    total_timesteps: int = 690_000
     log_interval_episodes: int = 10
     save_interval_episodes: int = 0  # 0 = disabled (only save best + final)
 
@@ -402,10 +417,7 @@ class Config:
         print("\nFEATURES:")
         print(f"  rsi_period: {self.features.rsi_period}")
         print(f"  volatility_window: {self.features.volatility_window}")
-        print(f"  vix_baseline / regimes: {self.features.vix_baseline} / "
-              f"{self.features.vix_regime_low}, {self.features.vix_regime_high}")
-        print(f"  credit baseline / regimes: {self.features.credit_baseline} / "
-              f"{self.features.credit_regime_low}, {self.features.credit_regime_high}")
+        print(f"  vix_baseline: {self.features.vix_baseline}")
         # Regime HMM
         print(f"  use_regime_hmm: {self.features.use_regime_hmm}")
         if self.features.use_regime_hmm:
@@ -422,6 +434,7 @@ class Config:
             if self.features.hmm_include_yc_change:
                 print(f"      hmm_yc_change_lag: {self.features.hmm_yc_change_lag}")
             print(f"    hmm_include_dxy: {self.features.hmm_include_dxy}")
+            print(f"    hmm_sticky_diag: {self.features.hmm_sticky_diag}")
         # Yield Curve
         print(f"  yield_curve_slope_scale: {self.features.yield_curve_slope_scale}")
         print(f"  yield_curve_change_lag: {self.features.yield_curve_change_lag}")

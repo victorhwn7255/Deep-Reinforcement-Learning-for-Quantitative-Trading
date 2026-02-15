@@ -71,8 +71,8 @@ def load_market_data(tickers, start, end, auto_adjust=True, progress=False) -> p
     # Forward-fill gaps conservatively, then drop remaining NAs
     df = df.ffill().dropna(how="any")
 
-    print(f"  ✓ Downloaded {len(df)} rows")
-    print(f"  ✓ Date range: {df.index.min().date()} to {df.index.max().date()}")
+    print(f"  [OK] Downloaded {len(df)} rows")
+    print(f"  [OK] Date range: {df.index.min().date()} to {df.index.max().date()}")
 
     MIN_DAYS_REQUIRED = 100
     if len(df) < MIN_DAYS_REQUIRED:
@@ -213,10 +213,10 @@ def add_technical_features(df_prices: pd.DataFrame, tickers: List[str], feat_cfg
         rsi = talib.RSI(close.values, timeperiod=int(feat_cfg.rsi_period))
         df[f"{t}_RSI"] = (rsi - 50.0) / 50.0
 
-        # Volatility (rolling std of log returns)
+        # Volatility (rolling std of log returns, rescaled to [0, 1])
         log_ret = log_price.diff()
         vol = log_ret.rolling(int(feat_cfg.volatility_window)).std()
-        df[f"{t}_volatility"] = (vol * np.sqrt(252)).clip(0.0, 2.0)
+        df[f"{t}_volatility"] = (vol * np.sqrt(252)).clip(0.0, 2.0) / 2.0  # Rescale to [0, 1]
 
         # 20-day log return (momentum)
         # log(P_t / P_{t-20}) = log(P_t) - log(P_{t-20})
@@ -258,11 +258,17 @@ def add_macro_features(df: pd.DataFrame, data_cfg, feat_cfg) -> pd.DataFrame:
     # VIX features
     # -----------------
     vix_baseline = float(feat_cfg.vix_baseline)
-    df2["VIX_normalized"] = (df2["VIX"] - vix_baseline) / vix_baseline
+    # Normalize with baseline=20, scale by 30, clip to [-1, 1]
+    # VIX=10 → -0.33, VIX=20 → 0, VIX=50 → +1.0
+    df2["VIX_normalized"] = np.clip((df2["VIX"] - vix_baseline) / 30.0, -1.0, 1.0)
 
-    low = float(feat_cfg.vix_regime_low)
-    high = float(feat_cfg.vix_regime_high)
-    df2["VIX_regime"] = np.where(df2["VIX"] < low, -1.0, np.where(df2["VIX"] < high, 0.0, 1.0))
+    # VIX regime: discrete indicator based on VIX level
+    # VIX < 15: -1 (low volatility / risk-on)
+    # 15 <= VIX < 30: 0 (normal)
+    # VIX >= 30: +1 (high volatility / risk-off)
+    vix_low = float(getattr(feat_cfg, "vix_regime_low", 15.0))
+    vix_high = float(getattr(feat_cfg, "vix_regime_high", 30.0))
+    df2["VIX_regime"] = np.where(df2["VIX"] < vix_low, -1.0, np.where(df2["VIX"] < vix_high, 0.0, 1.0))
 
     # term structure: (VIX3M - VIX) / VIX, clipped
     ts = (df2["VIX3M"] - df2["VIX"]) / (df2["VIX"] + 1e-8)
@@ -272,36 +278,39 @@ def add_macro_features(df: pd.DataFrame, data_cfg, feat_cfg) -> pd.DataFrame:
     # -----------------
     # Credit spread features
     # -----------------
-    credit_baseline = float(feat_cfg.credit_baseline)
-    df2["Credit_Spread_normalized"] = (df2["Credit_Spread"] - credit_baseline) / (credit_baseline + 1e-8)
-
-    c_low = float(feat_cfg.credit_regime_low)
-    c_high = float(feat_cfg.credit_regime_high)
-    df2["Credit_Spread_regime"] = np.where(df2["Credit_Spread"] < c_low, -1.0, np.where(df2["Credit_Spread"] < c_high, 0.0, 1.0))
+    # Credit spread regime: discrete indicator based on spread level
+    # spread < 2%: -1 (risk-on / low stress)
+    # 2% <= spread <= 4%: 0 (elevated)
+    # spread > 4%: +1 (risk-off / high stress)
+    c_low = float(getattr(feat_cfg, "credit_regime_low", 2.0))
+    c_high = float(getattr(feat_cfg, "credit_regime_high", 4.0))
+    df2["Credit_Spread_regime"] = np.where(df2["Credit_Spread"] < c_low, -1.0, np.where(df2["Credit_Spread"] <= c_high, 0.0, 1.0))
 
     # momentum
     mom_win = int(feat_cfg.credit_momentum_window)
     momentum = df2["Credit_Spread"].pct_change(mom_win)
     df2["Credit_Spread_momentum"] = np.clip(momentum, -float(feat_cfg.credit_momentum_clip), float(feat_cfg.credit_momentum_clip))
 
-    # z-score
+    # z-score (clipped then rescaled to [-1, 1])
     z_win = int(feat_cfg.credit_zscore_window)
     roll_mean = df2["Credit_Spread"].rolling(z_win).mean()
     roll_std = df2["Credit_Spread"].rolling(z_win).std()
     z = (df2["Credit_Spread"] - roll_mean) / (roll_std + 1e-8)
-    df2["Credit_Spread_zscore"] = np.clip(z, -float(feat_cfg.credit_zscore_clip), float(feat_cfg.credit_zscore_clip))
+    z_clip = float(feat_cfg.credit_zscore_clip)
+    df2["Credit_Spread_zscore"] = np.clip(z, -z_clip, z_clip) / z_clip  # Rescale to [-1, 1]
 
     # velocity
     lag = int(feat_cfg.credit_velocity_lag)
     vel = df2["Credit_Spread_momentum"].diff(lag)
     df2["Credit_Spread_velocity"] = np.clip(vel, -float(feat_cfg.credit_velocity_clip), float(feat_cfg.credit_velocity_clip))
 
-    # credit-vix divergence (z-score style on shorter window)
+    # credit-vix divergence (z-score style on shorter window, rescaled to [-1, 1])
     d_win = int(feat_cfg.credit_divergence_window)
     vix_norm = (df2["VIX"] - df2["VIX"].rolling(d_win).mean()) / (df2["VIX"].rolling(d_win).std() + 1e-8)
     cred_norm = (df2["Credit_Spread"] - df2["Credit_Spread"].rolling(d_win).mean()) / (df2["Credit_Spread"].rolling(d_win).std() + 1e-8)
     div = vix_norm - cred_norm
-    df2["Credit_VIX_divergence"] = np.clip(div, -float(feat_cfg.credit_divergence_clip), float(feat_cfg.credit_divergence_clip))
+    div_clip = float(feat_cfg.credit_divergence_clip)
+    df2["Credit_VIX_divergence"] = np.clip(div, -div_clip, div_clip) / div_clip  # Rescale to [-1, 1]
     
     # -----------------
     # Yield curve features
@@ -449,9 +458,29 @@ def add_regime_hmm_probabilities(df_all: pd.DataFrame, cfg, split_idx: int) -> p
         cols.append(df_all["VIX"].astype(float).ffill().fillna(0.0).values)
         feature_names.append("VIX")
 
-    if getattr(cfg.features, "hmm_include_credit_spread", True) and "Credit_Spread" in df_all.columns:
-        cols.append(df_all["Credit_Spread"].astype(float).ffill().fillna(0.0).values)
-        feature_names.append("Credit_Spread")
+    if getattr(cfg.features, "hmm_include_credit_spread", True):
+        # Use separate credit spread for HMM if configured (e.g., BBB for HMM, JUNK for SAC)
+        hmm_credit_path = getattr(cfg.features, "hmm_credit_spread_path", None)
+        if hmm_credit_path and os.path.exists(hmm_credit_path):
+            try:
+                hmm_credit_df = _read_macro_csv(
+                    hmm_credit_path,
+                    value_col_candidates=getattr(cfg.data, "credit_col_candidates", ["BAMLC0A4CBBB", "Credit_Spread"]),
+                    rename_to="HMM_Credit_Spread",
+                )
+                # Align with df_all index
+                hmm_credit = df_all.join(hmm_credit_df, how="left")["HMM_Credit_Spread"].ffill().fillna(0.0).values
+                cols.append(hmm_credit.astype(float))
+                feature_names.append("Credit_Spread_BBB")
+                if verbose:
+                    print(f"  [OK] HMM using separate credit spread: {hmm_credit_path}")
+            except Exception as e:
+                print(f"  [WARN] Failed to load HMM credit spread: {e}. Using main Credit_Spread.")
+                cols.append(df_all["Credit_Spread"].astype(float).ffill().fillna(0.0).values)
+                feature_names.append("Credit_Spread")
+        elif "Credit_Spread" in df_all.columns:
+            cols.append(df_all["Credit_Spread"].astype(float).ffill().fillna(0.0).values)
+            feature_names.append("Credit_Spread")
 
     if getattr(cfg.features, "hmm_include_vix_term", True) and "VIX_term_structure" in df_all.columns:
         cols.append(df_all["VIX_term_structure"].astype(float).ffill().fillna(0.0).values)
@@ -466,7 +495,7 @@ def add_regime_hmm_probabilities(df_all: pd.DataFrame, cfg, split_idx: int) -> p
             cols.append(yc_change)
             feature_names.append(f"YC_change_{yc_lag}d")
         else:
-            print("  ⚠ hmm_include_yc_change=True but YieldCurve_10Y3M_raw not found. "
+            print("  [WARN] hmm_include_yc_change=True but YieldCurve_10Y3M_raw not found. "
                   "Ensure use_yield_curve=True in config.")
 
     # --- DXY log return
@@ -477,7 +506,7 @@ def add_regime_hmm_probabilities(df_all: pd.DataFrame, cfg, split_idx: int) -> p
             cols.append(dxy_logret)
             feature_names.append("DXY_logret")
         else:
-            print("  ⚠ hmm_include_dxy=True but DXY_raw not found in dataframe. "
+            print("  [WARN] hmm_include_dxy=True but DXY_raw not found in dataframe. "
                   "Ensure dxy_path is correctly set in config.")
 
     X_all = np.column_stack(cols).astype(np.float64)
@@ -490,11 +519,12 @@ def add_regime_hmm_probabilities(df_all: pd.DataFrame, cfg, split_idx: int) -> p
 
     params, scaler = fit_gaussian_hmm_em(
         X_train,
-        n_states=int(getattr(cfg.features, "hmm_n_states", 3)),
-        n_iter=int(getattr(cfg.features, "hmm_n_iter", 50)),
+        n_states=int(getattr(cfg.features, "hmm_n_states", 4)),
+        n_iter=int(getattr(cfg.features, "hmm_n_iter", 300)),
         tol=float(getattr(cfg.features, "hmm_tol", 1e-4)),
-        min_var=float(getattr(cfg.features, "hmm_min_var", 1e-4)),
+        min_var=float(getattr(cfg.features, "hmm_min_var", 1e-3)),
         seed=int(cfg.experiment.seed),
+        sticky_diag=float(getattr(cfg.features, "hmm_sticky_diag", 0.95)),
     )
 
     # --- Reorder states by volatility dimension (index=1 => VIX by default), low->stable
@@ -507,10 +537,18 @@ def add_regime_hmm_probabilities(df_all: pd.DataFrame, cfg, split_idx: int) -> p
     probs, _ll = forward_filter(params, X_all_scaled)
 
     # --- Print HMM summary
-    prob_cols = list(getattr(cfg.features, "regime_prob_columns", [
-        "RegimeP_stable", "RegimeP_trans", "RegimeP_crisis"
-    ]))
-    state_names = ["Stable", "Transition", "Crisis"]
+    n_states = int(getattr(cfg.features, "hmm_n_states", 4))
+    if n_states == 4:
+        prob_cols = list(getattr(cfg.features, "regime_prob_columns", [
+            "RegimeP_bull", "RegimeP_caution", "RegimeP_stress", "RegimeP_crisis"
+        ]))
+        state_names = ["Bull", "Caution", "Stress", "Crisis"]
+    else:
+        # Default 3-state fallback
+        prob_cols = list(getattr(cfg.features, "regime_prob_columns", [
+            "RegimeP_stable", "RegimeP_trans", "RegimeP_crisis"
+        ]))
+        state_names = ["Stable", "Transition", "Crisis"]
 
     probs_train = probs[:split_idx]
     _print_hmm_summary(params, feature_names, state_names, probs_train, verbose=verbose)

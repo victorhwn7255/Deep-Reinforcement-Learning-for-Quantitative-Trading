@@ -34,18 +34,18 @@ print(f'  15 <= VIX < 30: {mid_count} days ({100*mid_count/len(df):.1f}%)')
 print(f'  VIX >= 30:      {high_count} days ({100*high_count/len(df):.1f}%)')
 
 # =============================================================================
-# Credit Spread Statistics
+# Credit Spread Statistics (High Yield / Junk Bond)
 # =============================================================================
 print()
 print('=' * 50)
-print('Credit Spread Statistics (2010-2024):')
+print('High Yield Credit Spread Statistics (2010-2024):')
 print('=' * 50)
 
 try:
-    df_credit = pd.read_csv('../../../data/CREDIT_SPREAD_2010_2024.csv', parse_dates=True, index_col=0)
+    df_credit = pd.read_csv('../../../data/CREDIT_SPREAD_JUNK_2010_2024.csv', parse_dates=True, index_col=0)
     # Try common column names
     col = None
-    for c in ['Credit_Spread', 'CREDIT_SPREAD', 'credit_spread', 'spread', df_credit.columns[0]]:
+    for c in ['BAMLH0A0HYM2', 'Credit_Spread', 'CREDIT_SPREAD', 'credit_spread', 'spread', df_credit.columns[0]]:
         if c in df_credit.columns:
             col = c
             break
@@ -56,32 +56,30 @@ try:
     df_credit = df_credit.dropna()
     spread = df_credit[col]
 
-    # Check if values are in percentage or decimal
-    if spread.mean() > 1:
-        print(f'(Data appears to be in percentage points, converting to decimal)')
-        spread = spread / 100
+    # Data is in percentage points (e.g., 4.7 = 4.7%)
+    print(f'(Data is in percentage points)')
 
     print(f'Count:    {len(spread)} days')
-    print(f'Mean:     {spread.mean():.4f} ({spread.mean()*100:.2f}%)')
-    print(f'Std Dev:  {spread.std():.4f} ({spread.std()*100:.2f}%)')
-    print(f'Median:   {spread.median():.4f} ({spread.median()*100:.2f}%)')
-    print(f'Min:      {spread.min():.4f} ({spread.min()*100:.2f}%)')
-    print(f'Max:      {spread.max():.4f} ({spread.max()*100:.2f}%)')
+    print(f'Mean:     {spread.mean():.2f}%')
+    print(f'Std Dev:  {spread.std():.2f}%')
+    print(f'Median:   {spread.median():.2f}%')
+    print(f'Min:      {spread.min():.2f}%')
+    print(f'Max:      {spread.max():.2f}%')
     print()
     print('Percentiles:')
-    print(f'  10th:   {spread.quantile(0.10):.4f} ({spread.quantile(0.10)*100:.2f}%)')
-    print(f'  25th:   {spread.quantile(0.25):.4f} ({spread.quantile(0.25)*100:.2f}%)')
-    print(f'  50th:   {spread.quantile(0.50):.4f} ({spread.quantile(0.50)*100:.2f}%)')
-    print(f'  75th:   {spread.quantile(0.75):.4f} ({spread.quantile(0.75)*100:.2f}%)')
-    print(f'  90th:   {spread.quantile(0.90):.4f} ({spread.quantile(0.90)*100:.2f}%)')
+    print(f'  10th:   {spread.quantile(0.10):.2f}%')
+    print(f'  25th:   {spread.quantile(0.25):.2f}%')
+    print(f'  50th:   {spread.quantile(0.50):.2f}%')
+    print(f'  75th:   {spread.quantile(0.75):.2f}%')
+    print(f'  90th:   {spread.quantile(0.90):.2f}%')
     print()
-    print('Regime distribution with current thresholds (low=0.02, high=0.04):')
-    low_count = (spread < 0.02).sum()
-    mid_count = ((spread >= 0.02) & (spread < 0.04)).sum()
-    high_count = (spread >= 0.04).sum()
-    print(f'  Spread < 2%:      {low_count} days ({100*low_count/len(spread):.1f}%)')
-    print(f'  2% <= Spread < 4%: {mid_count} days ({100*mid_count/len(spread):.1f}%)')
-    print(f'  Spread >= 4%:      {high_count} days ({100*high_count/len(spread):.1f}%)')
+    print('Regime distribution with current thresholds (low=3.7, high=5.5):')
+    low_count = (spread < 3.7).sum()
+    mid_count = ((spread >= 3.7) & (spread < 5.5)).sum()
+    high_count = (spread >= 5.5).sum()
+    print(f'  Spread < 3.7%:       {low_count} days ({100*low_count/len(spread):.1f}%)')
+    print(f'  3.7% <= Spread < 5.5%: {mid_count} days ({100*mid_count/len(spread):.1f}%)')
+    print(f'  Spread >= 5.5%:       {high_count} days ({100*high_count/len(spread):.1f}%)')
 
 except Exception as e:
     print(f'Error loading credit spread data: {e}')
