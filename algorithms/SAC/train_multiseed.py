@@ -1,10 +1,3 @@
-"""
-    python train_multiseed.py --no-hmm          # NON-HMM training
-    python train_multiseed.py                   # Use default 5 seeds
-    python train_multiseed.py --no-hmm --no-yield-curve
-    python train_multiseed.py --seeds 42 123    # Use specific seeds
-    python train_multiseed.py --num_seeds 3     # Use 3 random seeds
-"""
 
 from __future__ import annotations
 

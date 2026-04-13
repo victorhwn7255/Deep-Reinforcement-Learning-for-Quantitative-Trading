@@ -133,20 +133,20 @@ def main() -> None:
         cfg = Config.load_json(cfg_path)
         # Preserve the model_path you intended to evaluate
         cfg.evaluation.model_path = model_path
-        print(f"✓ Loaded training config: {cfg_path}")
+        print(f"Loaded training config: {cfg_path}")
     else:
-        print(f"⚠ No training config found at: {cfg_path}")
+        print(f"No training config found at: {cfg_path}")
         print("  Using default config (may cause state_dim mismatch if features differ).")
     
     cfg.ensure_dirs()
     cfg.set_global_seeds()
 
     device = cfg.auto_detect_device()
-    print(f"✓ Device: {device}")
+    print(f"Device: {device}")
 
     # Data
     _df_train, df_test, _feature_cols = load_and_prepare_data(cfg)
-    print(f"✓ Test rows: {len(df_test)}")
+    print(f"Test rows: {len(df_test)}")
 
     # Extract dates for time-based plots
     dates: Optional[pd.DatetimeIndex] = None

@@ -14,7 +14,6 @@ from sklearn.cluster import KMeans
 
 @dataclass
 class StandardScaler:
-    """Per-feature standard scaler. Fit on train only."""
     mean_: np.ndarray
     std_: np.ndarray
 
@@ -33,7 +32,6 @@ class StandardScaler:
 
 @dataclass
 class GaussianHMMParams:
-    """Diagonal Gaussian HMM params in *scaled* feature space."""
     pi: np.ndarray        # (K,)
     A: np.ndarray         # (K,K)
     means: np.ndarray     # (K,D)

@@ -6,21 +6,13 @@ from typing import List, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-# NOTE:
-# - This module is intentionally "config-aware" but does NOT import Config directly
-#   to avoid circular imports. Callers should pass the relevant sub-config objects.
-
 
 # =============================================================================
 # Market data
 # =============================================================================
 
 def load_market_data(tickers, start, end, auto_adjust=True, progress=False) -> pd.DataFrame:
-    """Download and clean market data from yfinance.
 
-    Returns:
-        DataFrame indexed by date with columns = tickers (Close prices, adjusted if auto_adjust=True)
-    """
     print(f"Downloading data for {tickers}...")
     try:
         import yfinance as yf  # type: ignore

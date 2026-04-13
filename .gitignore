@@ -156,6 +156,10 @@ plots/
 results/
 analysis_outputs/
 algorithms/testing/
+algorithms/A2C/results/
+testing/eval_results/
+notes/
+references/
 
 # macOS
 .DS_Store

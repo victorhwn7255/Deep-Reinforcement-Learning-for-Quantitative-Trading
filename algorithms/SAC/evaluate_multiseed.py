@@ -1,11 +1,3 @@
-"""
-
-python evaluate_multiseed.py --run_dir runs/multiseed_5seeds_20240101_120000
-python evaluate_multiseed.py --run_dir runs/multiseed_5seeds_20260118_110501 --per_seed_plots
-python evaluate_multiseed.py --model_paths models/seed_42/sac_best.pth models/seed_123/sac_best.pth
-
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -62,12 +54,6 @@ def print_header(title: str, char: str = "=", width: int = 80) -> None:
 
 
 def extract_seed_from_path(path: str) -> int:
-    """Extract seed number from model path.
-
-    Expects paths like: .../seed_42/sac_best.pth
-    Extracts seed from the parent directory name to avoid matching
-    patterns like 'multiseed_5seeds' in the run directory name.
-    """
     import re
     # Get the parent directory name (e.g., "seed_42" from ".../seed_42/sac_best.pth")
     parent_dir = os.path.basename(os.path.dirname(path))
@@ -88,7 +74,6 @@ def evaluate_single_model(
     df_test: pd.DataFrame,
     device: torch.device,
 ) -> EvalResult:
-    """Evaluate a single model on test data."""
 
     seed = extract_seed_from_path(model_path)
 

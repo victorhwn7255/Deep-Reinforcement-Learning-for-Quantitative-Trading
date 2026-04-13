@@ -16,7 +16,6 @@ import torch
 
 @dataclass
 class ExperimentConfig:
-    """Experiment / reproducibility knobs."""
     seed: int = 42
     run_name: str = "sac_portfolio"
     output_dir: str = "runs"          # where to store run artifacts (relative path)
@@ -26,7 +25,6 @@ class ExperimentConfig:
 
 @dataclass
 class DataConfig:
-    """Data loading and preprocessing configuration."""
     tickers: List[str] = field(default_factory=lambda: ["VNQ", "SPY", "TLT", "GLD", "BTC-USD"])
     start_date: str = "2010-01-01"
     end_date: str = "2024-12-31"
@@ -53,7 +51,6 @@ class DataConfig:
 
 @dataclass
 class FeatureConfig:
-    """Feature engineering knobs used to build environment state."""
     # Per-asset features (the environment will build columns as f"{ticker}_{name}")
     per_asset_feature_names: List[str] = field(default_factory=lambda: ["RSI", "volatility"])
 
@@ -137,7 +134,6 @@ class FeatureConfig:
 
 @dataclass
 class EnvironmentConfig:
-    """Trading environment configuration."""
     lag: int = 5
     include_position_in_state: bool = True
 
@@ -276,7 +272,6 @@ class Config:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     def auto_detect_device(self) -> torch.device:
-        """Pick the best device; avoid MPS for Dirichlet gradients."""
         if self.training.device is not None:
             return torch.device(self.training.device)
 
@@ -291,11 +286,6 @@ class Config:
         return torch.device("cpu")
 
     def compute_target_entropy(self, n_action: int) -> float:
-        """Dirichlet-native target entropy (in the same units as Dirichlet.entropy()).
-
-        If user provides sac.target_entropy, use it.
-        Otherwise, set target to entropy of symmetric Dirichlet([c]*K) minus a margin.
-        """
         if self.sac.target_entropy is not None:
             return float(self.sac.target_entropy)
 
@@ -319,21 +309,6 @@ class Config:
 
     @staticmethod
     def load_json(path: str) -> "Config":
-        """
-        Load config from JSON produced by Config.save_json().
-
-        This reconstructs nested dataclasses properly:
-        - experiment: ExperimentConfig
-        - data: DataConfig
-        - features: FeatureConfig
-        - env: EnvironmentConfig
-        - network: NetworkConfig
-        - sac: SACConfig
-        - training: TrainingConfig
-        - evaluation: EvaluationConfig
-
-        It also ignores unknown keys for forward/backward compatibility.
-        """
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
 
