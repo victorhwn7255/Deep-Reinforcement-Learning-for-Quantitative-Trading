@@ -20,7 +20,6 @@ def main():
 
     cfg = get_default_config()
 
-    # Enable HMM regime features
     cfg.features.use_regime_hmm = True
 
     cfg.ensure_dirs()

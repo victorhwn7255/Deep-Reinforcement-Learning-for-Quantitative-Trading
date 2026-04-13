@@ -16,17 +16,6 @@ from replay_buffer import ReplayBuffer
 
 
 class Agent:
-    """Soft Actor-Critic (SAC v2) agent with Dirichlet policy.
-
-    SAC v2:
-      - Twin critics Q1, Q2 with target critics Q1_target, Q2_target
-      - No Value network
-      - Target uses: min(Q_tgt(s',a')) - alpha * log pi(a'|s')
-
-    Production fix:
-      - Temperature tuning uses Dirichlet entropy directly (policy.entropy),
-        not log_prob scale heuristics.
-    """
 
     def __init__(self, state_dim: int, action_dim: int, cfg, device: torch.device):
         self.cfg = cfg

@@ -7,12 +7,6 @@ import pandas as pd
 
 
 class Env:
-    """Portfolio management environment with close-to-close mechanics.
-
-    Action: target weights over (n_assets + cash) that sum to 1 (simplex).
-            => action_dim = n_assets + 1
-    Reward: reward_scale * log1p(net_return) where net_return includes transaction costs.
-    """
 
     def __init__(self, df: pd.DataFrame, tickers: List[str], cfg):
         self.cfg = cfg
@@ -238,14 +232,7 @@ class Env:
         return float(oneway), float(total)
 
     def _compute_reward(self, net_return: float) -> float:
-        """Compute reward based on reward_type configuration.
 
-        Args:
-            net_return: Net return after transaction costs
-
-        Returns:
-            Scaled reward value
-        """
         net_return_clipped = float(np.clip(net_return, self.reward_clip_min, self.reward_clip_max))
 
         if self.reward_type == "log":

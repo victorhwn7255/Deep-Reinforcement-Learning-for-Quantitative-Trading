@@ -43,7 +43,6 @@ def build_mlp(
     layer_norm: bool = False,
     dropout: float = 0.0,
 ) -> nn.Sequential:
-    """Generic MLP builder. num_layers counts linear layers including output."""
     in_dim = int(in_dim)
     out_dim = int(out_dim)
     hidden_size = int(hidden_size)
