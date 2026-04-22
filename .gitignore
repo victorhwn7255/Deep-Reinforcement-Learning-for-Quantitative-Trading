@@ -154,9 +154,11 @@ videos/
 *.pt
 plots/
 results/
+# assets/
 analysis_outputs/
 algorithms/testing/
 algorithms/A2C/results/
+algorithms/PPO/
 testing/eval_results/
 notes/
 references/

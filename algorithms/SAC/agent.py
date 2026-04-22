@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from tqdm import tqdm
 
 from networks import SoftQNetwork, PolicyNetwork
 from replay_buffer import ReplayBuffer
@@ -252,7 +253,15 @@ class Agent:
         episode_net_returns = []
         episode_turnovers = []
 
-        for step in range(int(total_timesteps)):
+        pbar = tqdm(
+            range(int(total_timesteps)),
+            desc="SAC",
+            unit="step",
+            dynamic_ncols=True,
+            mininterval=1.0,
+            leave=True,
+        )
+        for step in pbar:
             self.global_step = step
 
             if step < self.learning_starts:
@@ -278,6 +287,13 @@ class Agent:
             if done:
                 episode_count += 1
                 episode_returns.append(float(episode_return))
+
+                pbar.set_postfix(
+                    ep=episode_count,
+                    ret=f"{episode_return:.3f}",
+                    alpha=f"{self.alpha:.3f}",
+                    refresh=False,
+                )
 
                 if self.cfg.experiment.verbose:
                     elapsed = time.time() - start_time
