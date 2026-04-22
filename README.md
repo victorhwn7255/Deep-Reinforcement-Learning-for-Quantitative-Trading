@@ -263,27 +263,6 @@ Being honest about what this project does and doesn't demonstrate:
 
 ---
 
-## Citation
-
-If this work is useful to your research, please cite the thesis:
-
-```bibtex
-@mastersthesis{he2026sacdirichlet,
-  title   = {Deep Reinforcement Learning for Quantitative Trading:
-             SAC-Dirichlet Framework with HMM Regime Detection for
-             Constrained Portfolio Optimization},
-  author  = {He, Weinan},
-  school  = {Nanyang Technological University, College of Computing and Data Science},
-  year    = {2026},
-  type    = {MSAI Master Project},
-  note    = {MSAI/25/007}
-}
-```
-
-Full thesis PDF: [`references/MSAI_25_007_MasterProject_Report_G2503102K_HE_WEINAN.pdf`](references/MSAI_25_007_MasterProject_Report_G2503102K_HE_WEINAN.pdf)
-
----
-
 ## Acknowledgments
 
 - **Supervisor:** Prof Bo An, NTU College of Computing and Data Science
